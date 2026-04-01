@@ -1,0 +1,20 @@
+.badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  color: var(--ifm-color-content-secondary);
+  background: var(--ifm-color-emphasis-100);
+  border-radius: 10px;
+  padding: 1px 7px;
+  margin-left: 0.4rem;
+  white-space: nowrap;
+}
+
+.badgeComplete {
+  color: #166534;
+  background: #dcfce7;
+}
+
+[data-theme='dark'] .badgeComplete {
+  color: #86efac;
+  background: #14532d;
+}
