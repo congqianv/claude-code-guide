@@ -1,0 +1,343 @@
+---
+sidebar_position: 4
+title: findRelevantMemories.ts：如何检索相关记忆
+description: 深入解析 Claude Code 如何用 AI 模型进行记忆的相关性筛选，以及 memoryScan.ts 的扫描机制
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# findRelevantMemories.ts：如何检索相关记忆
+
+<DifficultyBadge level="深度" />
+
+## 问题背景：记忆太多时怎么办？
+
+`MEMORY.md` 索引被整体注入系统提示（最多 200 行），但实际的记忆文件内容并不是每次都全部加载。设想一个使用了 6 个月的 Claude Code 实例，可能积累了 50-100 个记忆文件，总内容可能有几万个 token。全部加载既浪费 token 预算，又增加了无关信息的噪音。
+
+因此，系统需要一种"按需检索"机制：在每次用户发起查询时，判断哪些记忆文件与当前问题相关，只加载这些文件的内容。
+
+`findRelevantMemories.ts` 实现的就是这套机制。
+
+## 整体架构：两阶段检索
+
+```
+用户查询
+    │
+    ▼
+memoryScan.ts: scanMemoryFiles()
+    扫描记忆目录，读取所有 .md 文件的 frontmatter
+    只读前 30 行（包含 name/description/type）
+    返回 MemoryHeader[] （轻量元数据，不含正文）
+    │
+    ▼
+过滤 alreadySurfaced（去重：已在本会话展示过的记忆）
+    │
+    ▼
+selectRelevantMemories()
+    将 MemoryHeader[] 格式化为 manifest 清单
+    发送给 Claude Sonnet 模型
+    Sonnet 根据查询内容选出相关文件名（最多 5 个）
+    │
+    ▼
+返回 RelevantMemory[] = { path, mtimeMs }
+（调用方再读取这些文件的完整内容）
+```
+
+这是一个典型的"**AI 辅助检索**"模式：不依赖关键词匹配或向量相似度，而是直接让一个小模型（Sonnet）来判断相关性。
+
+## scanMemoryFiles：轻量扫描
+
+```typescript
+// source/src/memdir/memoryScan.ts
+const MAX_MEMORY_FILES = 200
+const FRONTMATTER_MAX_LINES = 30
+
+export async function scanMemoryFiles(
+  memoryDir: string,
+  signal: AbortSignal,
+): Promise<MemoryHeader[]> {
+  try {
+    const entries = await readdir(memoryDir, { recursive: true })
+    const mdFiles = entries.filter(
+      f => f.endsWith('.md') && basename(f) !== 'MEMORY.md',
+    )
+
+    const headerResults = await Promise.allSettled(
+      mdFiles.map(async (relativePath): Promise<MemoryHeader> => {
+        const filePath = join(memoryDir, relativePath)
+        const { content, mtimeMs } = await readFileInRange(
+          filePath,
+          0,
+          FRONTMATTER_MAX_LINES,  // 只读前 30 行
+          undefined,
+          signal,
+        )
+        const { frontmatter } = parseFrontmatter(content, filePath)
+        return {
+          filename: relativePath,
+          filePath,
+          mtimeMs,
+          description: frontmatter.description || null,
+          type: parseMemoryType(frontmatter.type),
+        }
+      }),
+    )
+
+    return headerResults
+      .filter((r): r is PromiseFulfilledResult<MemoryHeader> => r.status === 'fulfilled')
+      .map(r => r.value)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)  // 按修改时间倒序
+      .slice(0, MAX_MEMORY_FILES)             // 最多 200 个
+  } catch {
+    return []
+  }
+}
+```
+
+几个关键设计决策：
+
+### 只读前 30 行
+
+`readFileInRange(filePath, 0, 30, ...)` 只读取每个文件的前 30 行——这是整个 frontmatter 区域（name/description/type 字段通常在前 5-10 行，保守取 30 行）。不读取正文内容，大幅减少 I/O 开销。
+
+### Promise.allSettled（而非 Promise.all）
+
+使用 `Promise.allSettled` 而不是 `Promise.all`，意味着**单个文件读取失败不会中断整体扫描**。如果某个记忆文件损坏或被锁定，其他文件的扫描继续进行。
+
+### 按修改时间倒序排序
+
+扫描结果按 `mtimeMs` 从新到旧排序后，再取前 200 个。这保证了当记忆文件超过 200 个时，**最近修改的记忆有更高优先级**。
+
+背后的假设：最近修改的记忆更可能与当前工作相关。
+
+### 排除 MEMORY.md
+
+```typescript
+const mdFiles = entries.filter(
+  f => f.endsWith('.md') && basename(f) !== 'MEMORY.md',
+)
+```
+
+`MEMORY.md` 是索引文件，已经通过系统提示注入，不需要再被 `findRelevantMemories` 重复加载。
+
+## formatMemoryManifest：生成清单文本
+
+```typescript
+// source/src/memdir/memoryScan.ts
+export function formatMemoryManifest(memories: MemoryHeader[]): string {
+  return memories
+    .map(m => {
+      const tag = m.type ? `[${m.type}] ` : ''
+      const ts = new Date(m.mtimeMs).toISOString()
+      return m.description
+        ? `- ${tag}${m.filename} (${ts}): ${m.description}`
+        : `- ${tag}${m.filename} (${ts})`
+    })
+    .join('\n')
+}
+```
+
+生成的清单格式（送给 Sonnet 判断相关性）：
+
+```
+- [user] user_background.md (2026-03-15T10:30:00.000Z): 用户是 Go 工程师，对 React 不熟悉
+- [feedback] feedback_testing.md (2026-03-20T14:22:00.000Z): 集成测试用真实 DB，不得 mock
+- [project] project_auth_rewrite.md (2026-04-01T09:15:00.000Z): 认证中间件重写，合规要求驱动
+- [reference] reference_linear.md (2026-02-28T16:45:00.000Z): 管道 bug 在 Linear INGEST 项目中追踪
+```
+
+每行包含：`[类型]` + `文件名` + `(修改时间)` + `: 描述`。
+
+`description` 字段是 Sonnet 判断相关性的**唯一依据**（记忆正文不传入），这就是为什么写好 `description` 至关重要——模糊的描述会导致相关记忆被漏选。
+
+## selectRelevantMemories：AI 相关性判断
+
+```typescript
+// source/src/memdir/findRelevantMemories.ts
+const SELECT_MEMORIES_SYSTEM_PROMPT = `You are selecting memories that will be useful to Claude Code as it processes a user's query. You will be given the user's query and a list of available memory files with their filenames and descriptions.
+
+Return a list of filenames for the memories that will clearly be useful to Claude Code as it processes the user's query (up to 5). Only include memories that you are certain will be helpful based on their name and description.
+- If you are unsure if a memory will be useful in processing the user's query, then do not include it in your list. Be selective and discerning.
+- If there are no memories in the list that would clearly be useful, feel free to return an empty list.
+- If a list of recently-used tools is provided, do not select memories that are usage reference or API documentation for those tools (Claude Code is already exercising them). DO still select memories containing warnings, gotchas, or known issues about those tools — active use is exactly when those matter.
+`
+
+async function selectRelevantMemories(
+  query: string,
+  memories: MemoryHeader[],
+  signal: AbortSignal,
+  recentTools: readonly string[],
+): Promise<string[]> {
+  const validFilenames = new Set(memories.map(m => m.filename))
+  const manifest = formatMemoryManifest(memories)
+
+  const toolsSection = recentTools.length > 0
+    ? `\n\nRecently used tools: ${recentTools.join(', ')}`
+    : ''
+
+  const result = await sideQuery({
+    model: getDefaultSonnetModel(),
+    system: SELECT_MEMORIES_SYSTEM_PROMPT,
+    skipSystemPromptPrefix: true,
+    messages: [{
+      role: 'user',
+      content: `Query: ${query}\n\nAvailable memories:\n${manifest}${toolsSection}`,
+    }],
+    max_tokens: 256,
+    output_format: {
+      type: 'json_schema',
+      schema: {
+        type: 'object',
+        properties: {
+          selected_memories: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['selected_memories'],
+        additionalProperties: false,
+      },
+    },
+    signal,
+    querySource: 'memdir_relevance',
+  })
+  // ...
+}
+```
+
+### sideQuery：旁路查询
+
+`sideQuery` 是一个特殊的 API 调用接口，用于发起不进入主对话流的辅助查询。它：
+- 使用 `claude-sonnet` 模型（而非主对话使用的 Opus/Sonnet）
+- 设置 `skipSystemPromptPrefix: true`（不加载完整系统提示，减少 token）
+- 只需要 256 个输出 token（只返回文件名列表）
+
+这是一个典型的**以 AI 判断代替规则代码**的模式。
+
+### JSON Schema 输出约束
+
+```json
+{
+  "type": "json_schema",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "selected_memories": { "type": "array", "items": { "type": "string" } }
+    },
+    "required": ["selected_memories"],
+    "additionalProperties": false
+  }
+}
+```
+
+使用结构化输出（JSON Schema）而不是纯文本，避免解析失败的风险，同时限制了输出格式。
+
+### 安全验证：过滤无效文件名
+
+```typescript
+const parsed: { selected_memories: string[] } = jsonParse(textBlock.text)
+return parsed.selected_memories.filter(f => validFilenames.has(f))
+```
+
+Sonnet 可能返回的文件名不一定存在于实际文件列表（幻觉）。通过 `validFilenames.has(f)` 过滤，确保只返回真实存在的文件名。
+
+### recentTools：避免工具文档噪音
+
+```typescript
+const toolsSection = recentTools.length > 0
+  ? `\n\nRecently used tools: ${recentTools.join(', ')}`
+  : ''
+```
+
+如果用户最近使用了某个工具（如 `mcp__spawn`），Sonnet 被明确告知：**不要选择该工具的使用文档类记忆**（Claude 已经在用了，不需要再提醒），**但仍然要选择关于该工具的警告/陷阱类记忆**（正在使用时最需要知道这些）。
+
+这个细节显示了系统设计者对"误报"（false positive）的重视：选了不相关的记忆比不选相关记忆的危害更大，因为它增加了上下文噪音。
+
+## findRelevantMemories：整合入口
+
+```typescript
+// source/src/memdir/findRelevantMemories.ts
+export async function findRelevantMemories(
+  query: string,
+  memoryDir: string,
+  signal: AbortSignal,
+  recentTools: readonly string[] = [],
+  alreadySurfaced: ReadonlySet<string> = new Set(),
+): Promise<RelevantMemory[]> {
+  const memories = (await scanMemoryFiles(memoryDir, signal)).filter(
+    m => !alreadySurfaced.has(m.filePath),
+  )
+  if (memories.length === 0) {
+    return []
+  }
+
+  const selectedFilenames = await selectRelevantMemories(
+    query, memories, signal, recentTools,
+  )
+  const byFilename = new Map(memories.map(m => [m.filename, m]))
+  const selected = selectedFilenames
+    .map(filename => byFilename.get(filename))
+    .filter((m): m is MemoryHeader => m !== undefined)
+
+  // 可选：记录遥测数据
+  if (feature('MEMORY_SHAPE_TELEMETRY')) {
+    const { logMemoryRecallShape } = require('./memoryShapeTelemetry.js')
+    logMemoryRecallShape(memories, selected)
+  }
+
+  return selected.map(m => ({ path: m.filePath, mtimeMs: m.mtimeMs }))
+}
+```
+
+`alreadySurfaced` 参数是一个重要的去重机制：同一次会话中，已经展示给用户的记忆文件路径会被记录下来。下次调用 `findRelevantMemories` 时，这些路径会从候选池中过滤掉，让 Sonnet 把有限的 5 个名额用于**新的**相关记忆，而不是重复选同一批文件。
+
+## 返回值的结构
+
+```typescript
+export type RelevantMemory = {
+  path: string       // 绝对文件路径
+  mtimeMs: number    // 修改时间（毫秒）
+}
+```
+
+注意返回值**不包含文件内容**。`findRelevantMemories` 只告诉调用方"这些文件相关"，由调用方决定如何读取内容（通常是通过 FileReadTool 或直接注入到用户消息上下文）。
+
+`mtimeMs` 被携带到返回值中，让调用方可以通过 `memoryAge.ts` 计算新鲜度，不需要再做一次 `stat` 系统调用。
+
+## 性能考量
+
+整个 `findRelevantMemories` 调用链的开销：
+
+| 步骤 | 开销 |
+|------|------|
+| `readdir`（递归扫描） | 1 次 I/O，一般 < 10ms |
+| `readFileInRange` × N（读前 30 行） | N 次 I/O，并发执行 |
+| `sideQuery` to Sonnet | ~200-500ms，网络 RTT |
+| JSON 解析 + 验证 | 可忽略 |
+
+主要开销是 Sonnet 的旁路查询。这是一个有意识的权衡：用 200-500ms 的延迟换取高质量的相关性判断，而不是用低延迟的关键词匹配换取低精度的结果。
+
+在实现上，`findRelevantMemories` 通常会**提前发起**（在用户消息抵达时并行处理），不在主响应流的关键路径上。
+
+## 模块拆分的原因
+
+`memoryScan.ts` 和 `findRelevantMemories.ts` 是有意分离的——注释说明了原因：
+
+> Split out of findRelevantMemories.ts so extractMemories can import the scan without pulling in sideQuery and the API-client chain (which closed a cycle through memdir.ts — #25372).
+
+`extractMemories`（从对话中提取记忆的后台 agent）只需要扫描能力，不需要相关性判断。如果 scan 和 find 在同一文件，`extractMemories` 就会间接引入 `sideQuery` 和整个 API 客户端链，形成循环依赖。拆分后，两者可以独立导入。
+
+这是一个**依赖管理驱动的模块拆分**决策。
+
+## 小结
+
+`findRelevantMemories` 的设计体现了记忆系统的核心理念：
+
+1. **轻量扫描，按需深读**：先读 frontmatter，再读正文，减少 I/O
+2. **AI 判断相关性**：用语言模型的语义理解能力，而不是关键词匹配
+3. **精确而非召回**：宁可漏选，不要多选（5 个名额，selective and discerning）
+4. **新鲜度意识**：mtime 信息从扫描到展示全程携带，供后续处理
+
+<SourceRef file="source/src/memdir/findRelevantMemories.ts" lines="1-141" />
+<SourceRef file="source/src/memdir/memoryScan.ts" lines="1-94" />
+
+<ArticleComplete />

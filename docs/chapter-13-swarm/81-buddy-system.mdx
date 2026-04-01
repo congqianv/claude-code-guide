@@ -1,0 +1,252 @@
+---
+sidebar_position: 11
+title: Buddy 系统：companion.ts 是什么，和 Teammate 有何区别
+description: 解析 Claude Code 的 Buddy 伴侣系统——一个与 Swarm Teammate 完全不同的个人化功能，深入了解其设计理念与 companion.ts 的核心逻辑
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Buddy 系统：companion.ts 是什么，和 Teammate 有何区别
+
+<DifficultyBadge level="进阶" />
+
+## 惊喜：Buddy 不是 Swarm 的一部分
+
+在探索 Claude Code 的 `buddy/` 目录之前，你可能会期待看到某种"轻量级 Teammate"或"快速响应的辅助 Agent"。实际上，**Buddy（伙伴）与 Swarm 协作系统完全无关**。
+
+Buddy 是一个**个人化的虚拟伙伴系统**，每个用户有一个独一无二的像素风格角色（duck、cat、dragon…），带有随机生成的外貌（帽子、眼睛、稀有度）和个性（由 AI 生成的名字和性格描述）。这是一个彩蛋式的游戏化功能，让 Claude Code 的使用体验更有趣味性。
+
+## Buddy 与 Teammate 的核心区别
+
+| 维度 | Teammate（Swarm） | Buddy（companion） |
+|------|-----------------|-----------------|
+| 本质 | 独立的 Claude Agent，可执行工具 | 虚拟角色，没有 AI 能力 |
+| 生命周期 | 会话期间存在，任务完成后关闭 | 永久绑定用户账户 |
+| 数量 | 一个 Swarm 可以有多个 | 每个用户只有一个 |
+| 目的 | 并行执行任务，提高效率 | 提供情感陪伴，增加趣味 |
+| 存储 | `~/.claude/teams/` 团队目录 | `~/.claude/config.json` 全局配置 |
+| 交互方式 | 通过邮箱、权限请求协作 | 在 UI 角落显示动画精灵 |
+
+## companion.ts 的核心逻辑
+
+`companion.ts` 负责**确定性地生成**用户的 Buddy 外貌属性（称为 `bones`，骨骼），以及管理 Buddy 的整体生命周期。
+
+### 确定性生成：为什么要用种子哈希？
+
+```typescript
+// Mulberry32 —— 轻量级、可重复的伪随机数生成器
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return function () {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+```
+
+`Mulberry32` 是一个基于种子的伪随机数生成器。使用种子的原因：**相同的 userId 始终生成相同的 Buddy**。
+
+这个设计解决了一个有趣的工程问题：Buddy 的外貌不存储在配置文件中（只存储 `CompanionSoul`），而是每次从 `userId` 重新计算。这样即使配置文件被删除，Buddy 也不会"变脸"。
+
+### 哈希函数
+
+```typescript
+function hashString(s: string): number {
+  if (typeof Bun !== 'undefined') {
+    return Number(BigInt(Bun.hash(s)) & 0xffffffffn)  // Bun 的内置哈希（更快）
+  }
+  // FNV-1a 哈希（Node.js 回退）
+  let h = 2166136261
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+```
+
+### 盐值
+
+```typescript
+const SALT = 'friend-2026-401'
+```
+
+加盐确保即使两个用户有相同的账户 UUID（理论上不可能，但防御性编程），生成的 Buddy 也不同。`2026-401` 暗示这个系统是在 2026 年 4 月 1 日（即本文档的当前日期）附近设计的。
+
+## Buddy 的外貌属性（CompanionBones）
+
+```typescript
+export type CompanionBones = {
+  rarity: Rarity    // 稀有度：common/uncommon/rare/epic/legendary
+  species: Species  // 种类：duck/cat/dragon/owl 等 18 种
+  eye: Eye          // 眼睛风格：6 种符号
+  hat: Hat          // 帽子：8 种（common 没有帽子）
+  shiny: boolean    // 是否闪亮（概率 1%）
+  stats: Record<StatName, number>  // 5 项属性值
+}
+```
+
+### 18 种 Species（种类）
+
+```typescript
+// 注意：部分种类名称通过字符编码构建，避免触发构建检查
+export const SPECIES = [
+  duck, goose, blob, cat, dragon, octopus, owl, penguin,
+  turtle, snail, ghost, axolotl, capybara, cactus, robot,
+  rabbit, mushroom, chonk,
+] as const
+```
+
+源码注释中有一个有趣的说明：
+
+> One species name collides with a model-codename canary in excluded-strings.txt. The check greps build output (not source), so runtime-constructing the value keeps the literal out of the bundle while the check stays armed for the actual codename.
+
+某个种类名称（通过字符编码可以看出是 `claude`——不，实际上是 `goose`，对应某个模型代号）会触发构建时的字符串检查，所以通过 `String.fromCharCode()` 运行时构建来绕过。
+
+### 稀有度系统
+
+```typescript
+export const RARITY_WEIGHTS = {
+  common: 60,      // 60% 概率
+  uncommon: 25,    // 25% 概率
+  rare: 10,        // 10% 概率
+  epic: 4,         //  4% 概率
+  legendary: 1,    //  1% 概率
+} as const
+```
+
+稀有度决定了：
+- 是否有帽子（common 没有帽子）
+- 属性值的基础下限（legendary 的最低属性值更高）
+- UI 颜色（在主题颜色中对应不同的颜色变量）
+
+### 5 项属性（StatName）
+
+```typescript
+export const STAT_NAMES = [
+  'DEBUGGING', 'PATIENCE', 'CHAOS', 'WISDOM', 'SNARK',
+] as const
+```
+
+这 5 项属性的名称幽默地暗示了程序员的特质（调试能力、耐心、混乱度、智慧、毒舌程度）。属性值分布遵循"峰值-低谷"规则：
+
+```typescript
+function rollStats(rng: () => number, rarity: Rarity): Record<StatName, number> {
+  const floor = RARITY_FLOOR[rarity]  // 稀有度越高，下限越高
+  const peak = pick(rng, STAT_NAMES)  // 随机选一项峰值属性
+  let dump = pick(rng, STAT_NAMES)    // 随机选一项弱项属性
+  while (dump === peak) dump = pick(rng, STAT_NAMES)  // 确保两者不同
+
+  for (const name of STAT_NAMES) {
+    if (name === peak)       stats[name] = floor + 50 + random(30)  // 高
+    else if (name === dump)  stats[name] = max(1, floor - 10 + random(15))  // 低
+    else                     stats[name] = floor + random(40)  // 中等
+  }
+}
+```
+
+## Buddy 的灵魂（CompanionSoul）
+
+`CompanionBones` 是确定性生成的，但 `CompanionSoul` 是由 AI 生成并持久化存储的：
+
+```typescript
+export type CompanionSoul = {
+  name: string         // AI 起的名字
+  personality: string  // AI 生成的性格描述
+}
+
+// 实际存储在 ~/.claude/config.json 中的格式：
+export type StoredCompanion = CompanionSoul & {
+  hatchedAt: number  // 孵化时间戳
+}
+```
+
+设计要点：`CompanionBones` 不存储（可重新计算），`CompanionSoul` 存储（唯一、不可重复生成）。这样即使 `SPECIES` 数组顺序改变（如添加新种类），Buddy 的种类可能显示名称会变，但其"灵魂"（名字和个性）不会丢失。
+
+## getCompanion() — 组合展示
+
+```typescript
+export function getCompanion(): Companion | undefined {
+  const stored = getGlobalConfig().companion
+  if (!stored) return undefined  // 尚未孵化
+
+  const { bones } = roll(companionUserId())  // 重新计算 bones
+
+  // bones 在后面，确保存储中的旧 bones 字段被最新计算覆盖
+  // 这样 SPECIES 数组更新不会破坏已存储的 Companion
+  return { ...stored, ...bones }
+}
+```
+
+## 性能优化：滚动缓存
+
+Buddy 在三个"热路径"中被访问：
+1. 500ms 动画精灵刷新（`CompanionSprite`）
+2. 每次键盘输入（`PromptInput` 组件）
+3. 每次 AI 轮次（观察者）
+
+如果每次都重新计算哈希，会有性能开销。因此实现了一个简单的单值缓存：
+
+```typescript
+let rollCache: { key: string; value: Roll } | undefined
+
+export function roll(userId: string): Roll {
+  const key = userId + SALT
+  if (rollCache?.key === key) return rollCache.value  // 命中缓存
+
+  const value = rollFrom(mulberry32(hashString(key)))
+  rollCache = { key, value }  // 更新缓存
+  return value
+}
+```
+
+由于 userId 在会话期间不变，这个缓存实际上始终命中（初始化后第一次计算，之后全部命中）。
+
+## Buddy 的 UI 渲染
+
+Buddy 通过 `CompanionSprite.tsx` 在 Claude Code 终端 UI 的某个角落显示像素风格的动画：
+
+```
+  _
+ (o.o)     ← duck（duck 种类示意）
+ (> <)
+  ╬╬
+```
+
+精灵动画帧存储在 `sprites.ts` 中，根据 Buddy 的种类和当前活动状态（空闲/工作/思考）切换不同帧。`useBuddyNotification.tsx` 处理 Buddy 的通知触发逻辑（如 AI 完成一轮时触发特定动画）。
+
+## 与 Teammate 的设计哲学对比
+
+| 设计维度 | Teammate | Buddy |
+|---------|---------|-------|
+| 设计驱动力 | 工程效率（并行任务） | 用户体验（情感连接） |
+| 复杂度 | 高（权限系统、邮箱、生命周期） | 低（哈希 + 存储） |
+| 代码位置 | `utils/swarm/`、`tasks/InProcessTeammateTask/` | `buddy/` |
+| 与 AI 的关系 | Teammate 本身就是 AI 实例 | Buddy 是 AI 为用户生成的非 AI 角色 |
+| 持久化 | 会话结束清理 | 永久保留 |
+
+## 小结
+
+Buddy 系统展示了 Claude Code 团队对产品人性化的关注——在严肃的工程工具中埋入了一个充满趣味的彩蛋。
+
+关键设计亮点：
+- **确定性生成**：相同用户始终得到相同的 Buddy，不依赖服务器
+- **骨肉分离**：外貌（bones）重新计算，灵魂（soul）持久化
+- **性能友好**：单值缓存消除重复哈希计算
+- **零网络依赖**：Buddy 的生成完全本地化，不需要任何 API 调用
+
+Buddy 和 Teammate 是两个完全不同维度的功能。如果说 Teammate 是让 Claude 更强大的工程机制，那么 Buddy 就是让 Claude 更有温度的用户体验设计。
+
+---
+
+> **参考说明**：`companion.ts` 实际为用户虚拟伙伴的生成逻辑，与 Swarm 协作系统无直接关联，本文根据源码（`/Users/admin/Desktop/package/source/src/buddy/companion.ts` 和 `types.ts`）及目录结构分析得出。
+
+<SourceRef file="source/src/buddy/companion.ts" lines="1-134" />
+<SourceRef file="source/src/buddy/types.ts" lines="1-149" />
+
+<ArticleComplete />

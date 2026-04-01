@@ -1,0 +1,287 @@
+---
+sidebar_position: 2
+title: memoryTypes.ts：记忆的数据结构与分类
+description: 深入解析 Claude Code 记忆系统的四种类型分类及其 TypeScript 数据结构
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# memoryTypes.ts：记忆的数据结构与分类
+
+<DifficultyBadge level="进阶" />
+
+## 概述
+
+`memoryTypes.ts` 是 memdir 记忆系统的类型定义核心。它定义了记忆的分类体系，以及 Claude 在读写记忆时所遵循的行为规范。这个文件不仅包含 TypeScript 类型，还包含大量会被直接注入到 Claude 系统提示中的文本常量。
+
+## MemoryType：四种记忆类型
+
+```typescript
+// source/src/memdir/memoryTypes.ts
+export const MEMORY_TYPES = [
+  'user',
+  'feedback',
+  'project',
+  'reference',
+] as const
+
+export type MemoryType = (typeof MEMORY_TYPES)[number]
+```
+
+这是一个典型的 TypeScript "const assertion" 模式，`MemoryType` 被推断为联合类型 `'user' | 'feedback' | 'project' | 'reference'`。
+
+设计上故意选择了**封闭的四种类型**，而不是开放的字符串枚举。原因在注释中有明确说明：
+
+> Memories are constrained to four types capturing context NOT derivable from the current project state.
+
+只有那些**无法从项目状态推导出来**的信息，才应该保存为记忆。
+
+### user 类型：用户画像记忆
+
+**存储什么**：用户的角色、目标、技术背景、工作职责。
+
+**核心价值**：让 Claude 根据不同用户的背景调整回答方式。
+
+```markdown
+---
+name: user_background
+description: 用户是有 10 年 Go 经验的后端工程师，首次接触前端
+type: user
+---
+
+用户是资深 Go 工程师，专注于后端开发，对 React 生态不熟悉。
+在解释前端概念时，用后端类比（channel → event stream，goroutine → async task）。
+
+**Why:** 用户明确表达了 Go 背景，希望通过熟悉的概念建立前端知识体系
+**How to apply:** 解释组件生命周期时可类比 Go 的 context 传递模式
+```
+
+**scope（在 COMBINED 模式下）**：always private。用户画像是个人信息，不应共享给团队。
+
+### feedback 类型：行为反馈记忆
+
+**存储什么**：用户对 Claude 工作方式的明确纠正或确认。
+
+**核心价值**：让 Claude 在同一项目/用户中保持行为一致性，不反复犯同样的错误。
+
+```markdown
+---
+name: feedback_test_real_db
+description: 集成测试必须使用真实数据库，不得使用 mock
+type: feedback
+---
+
+集成测试必须连接真实数据库，不得使用 mock。
+
+**Why:** 上个季度 mock 测试全部通过但生产环境迁移失败，因为 mock 与真实行为不一致
+**How to apply:** 每次写集成测试时，确认使用 testcontainers 或真实 DB 连接，拒绝任何 mock DB 方案
+```
+
+这里有一个重要的设计细节：feedback 记忆不仅记录"纠正"，也记录"确认"。源码注释特别强调：
+
+> Record from failure AND success: if you only save corrections, you will avoid past mistakes but drift away from approaches the user has already validated.
+
+如果只记录错误，Claude 会过于保守，连已经验证有效的方法也会回避。
+
+**scope**：default to private，但如果是项目级编码规范则应为 team。
+
+### project 类型：项目状态记忆
+
+**存储什么**：正在进行中的工作、决策背景、时间节点、已知问题。
+
+**核心价值**：帮助 Claude 理解"为什么"，而不只是"是什么"。
+
+```markdown
+---
+name: project_auth_rewrite
+description: 认证中间件重写是合规要求驱动的，不是技术债清理
+type: project
+---
+
+认证中间件重写项目（2026-04-30 deadline）由法务/合规要求驱动。
+原因：旧版 session token 存储方式不符合新的合规标准。
+
+**Why:** 法务明确要求，不是技术偏好
+**How to apply:** 技术方案选择时优先满足合规要求而不是优化开发体验；不要建议"先技术债再合规"的分阶段方案
+```
+
+注意一个重要规则：`project` 类型的记忆中，相对日期必须转换为绝对日期。源码注释中说明了原因：
+
+> Always convert relative dates in user messages to absolute dates when saving (e.g., "Thursday" → "2026-03-05"), so the memory remains interpretable after time passes.
+
+project 类型的记忆**衰减最快**——项目状态随时变化，一个月前的 deadline 记录可能完全失效。
+
+**scope**：strongly bias toward team。项目状态是共享知识，应让团队成员都能获益。
+
+### reference 类型：外部资源指针
+
+**存储什么**：外部系统的位置和用途（Linear、Grafana、Slack 频道等）。
+
+**核心价值**：当用户提到外部系统时，Claude 能知道去哪里找信息。
+
+```markdown
+---
+name: reference_pipeline_bugs
+description: 管道 bug 在 Linear 项目 INGEST 中追踪
+type: reference
+---
+
+管道相关的 bug 和问题在 Linear 项目 "INGEST" 中追踪。
+Grafana 监控面板：grafana.internal/d/api-latency（oncall 监控的延迟看板）
+
+**Why:** 用户提及在修改请求处理代码时需要检查此看板，以免触发告警
+**How to apply:** 修改请求处理路径时，主动提示查看 Grafana 延迟看板
+```
+
+**scope**：usually team。外部系统的位置是团队共享知识。
+
+## parseMemoryType：容错的类型解析
+
+```typescript
+// source/src/memdir/memoryTypes.ts
+export function parseMemoryType(raw: unknown): MemoryType | undefined {
+  if (typeof raw !== 'string') return undefined
+  return MEMORY_TYPES.find(t => t === raw)
+}
+```
+
+这个函数从 Markdown frontmatter 中解析 `type` 字段。设计上选择**容错降级**而不是报错：
+
+- `type: user` → 返回 `'user'`
+- `type: unknown_type` → 返回 `undefined`（不崩溃）
+- frontmatter 中没有 `type` 字段 → 返回 `undefined`（向后兼容）
+
+这保证了旧版记忆文件（没有 `type` 字段）在新版系统中仍然可以正常工作。
+
+## MemoryHeader：内存中的记忆摘要
+
+虽然 `MemoryHeader` 类型定义在 `memoryScan.ts` 中，但它与 `memoryTypes.ts` 的类型紧密配合：
+
+```typescript
+// source/src/memdir/memoryScan.ts
+export type MemoryHeader = {
+  filename: string       // 相对路径，如 "user_role.md"
+  filePath: string       // 绝对路径
+  mtimeMs: number        // 文件修改时间（毫秒时间戳）
+  description: string | null  // frontmatter 中的 description 字段
+  type: MemoryType | undefined  // parseMemoryType 的结果
+}
+```
+
+`MemoryHeader` 是在内存中表示一条记忆的轻量结构。注意它**不包含记忆的正文内容**——只有元数据。这是一个重要的性能设计：在做相关性筛选时，只需要读取每个文件的前 30 行（frontmatter 部分），不需要加载全文。
+
+## 记忆文件的 frontmatter 格式
+
+系统规定每个记忆文件必须有如下 frontmatter：
+
+```markdown
+---
+name: {{memory name}}
+description: {{one-line description — used to decide relevance in future conversations, so be specific}}
+type: {{user, feedback, project, reference}}
+---
+
+{{memory content — for feedback/project types, structure as: rule/fact, then **Why:** and **How to apply:** lines}}
+```
+
+`description` 字段特别重要：它是相关性检索的**核心依据**。当 `findRelevantMemories` 向 Claude Sonnet 询问"哪些记忆和当前查询相关"时，Sonnet 看到的就是每条记忆的 filename + description，而不是完整内容。
+
+所以一个好的 description 应该：
+- 具体而精确（"用户是 Go 工程师，对 React 不熟悉"）
+- 不要模糊（"关于用户的信息"）
+- 能从标题猜出大意，但在描述中补充关键上下文
+
+## 四大行为规范常量
+
+`memoryTypes.ts` 中不只有类型定义，还包含四个重要的文本常量，这些文本会被拼接进 Claude 的系统提示，直接影响 Claude 的记忆行为：
+
+### WHAT_NOT_TO_SAVE_SECTION
+
+明确告诉 Claude 什么**不该**保存为记忆：
+
+```typescript
+export const WHAT_NOT_TO_SAVE_SECTION: readonly string[] = [
+  '## What NOT to save in memory',
+  '',
+  '- Code patterns, conventions, architecture, file paths, or project structure',
+  '- Git history, recent changes, or who-changed-what',
+  '- Debugging solutions or fix recipes',
+  '- Anything already documented in CLAUDE.md files.',
+  '- Ephemeral task details: in-progress work, temporary state, current conversation context.',
+  // ...
+]
+```
+
+这个列表防止 Claude 把"可推导的信息"也存入记忆，避免记忆膨胀和信息冗余。
+
+### WHEN_TO_ACCESS_SECTION
+
+规定什么时候**该主动读取**记忆：
+
+```typescript
+export const WHEN_TO_ACCESS_SECTION: readonly string[] = [
+  '## When to access memories',
+  '- When memories seem relevant, or the user references prior-conversation work.',
+  '- You MUST access memory when the user explicitly asks you to check, recall, or remember.',
+  '- If the user says to *ignore* or *not use* memory: proceed as if MEMORY.md were empty.',
+  MEMORY_DRIFT_CAVEAT,
+]
+```
+
+### MEMORY_DRIFT_CAVEAT
+
+防止 Claude 把记忆当成绝对真理：
+
+```typescript
+export const MEMORY_DRIFT_CAVEAT =
+  '- Memory records can become stale over time. Use memory as context for what was true at a given point in time. Before answering the user or building assumptions based solely on information in memory records, verify that the memory is still correct and up-to-date...'
+```
+
+### TRUSTING_RECALL_SECTION
+
+专门处理"记忆中提到了某个文件/函数，但那个文件已经被删除了"这类问题：
+
+```typescript
+export const TRUSTING_RECALL_SECTION: readonly string[] = [
+  '## Before recommending from memory',
+  '',
+  'A memory that names a specific function, file, or flag is a claim that it existed *when the memory was written*. It may have been renamed, removed, or never merged. Before recommending it:',
+  '',
+  '- If the memory names a file path: check the file exists.',
+  '- If the memory names a function or flag: grep for it.',
+  // ...
+]
+```
+
+这段文本的命名有讲究：根据源码注释，曾经测试过用 "Trusting what you recall" 作为标题，但效果不如 "Before recommending from memory"——后者是**动作触发点**（在要做推荐之前），而不是抽象概念，所以更能让模型在正确时机触发相关行为。
+
+## 个人模式 vs 联合模式
+
+`memoryTypes.ts` 中有两套类型描述文本：`TYPES_SECTION_INDIVIDUAL` 和 `TYPES_SECTION_COMBINED`。
+
+**`TYPES_SECTION_INDIVIDUAL`**（只有个人记忆时使用）：
+- 没有 `<scope>` 标签
+- 例子中使用 `[saves X memory: ...]` 格式
+
+**`TYPES_SECTION_COMBINED`**（同时有个人记忆和团队记忆时使用）：
+- 每个类型都有 `<scope>` 标签
+- 例子中区分 private 和 team scope
+- 多了安全提示："不要把 API key 等敏感数据存入团队记忆"
+
+注释中解释了为什么要维护两套而不是通过参数生成一套：
+
+> intentionally duplicated rather than generated from a shared spec — keeping them flat makes per-mode edits trivial without reasoning through a helper's conditional rendering.
+
+这是一个"明确优于聪明"的工程决策：两份文本独立修改更安全，生成逻辑的 bug 更难追踪。
+
+## 小结
+
+`memoryTypes.ts` 的设计体现了一个重要原则：**记忆系统的行为规范不应该硬编码在代码逻辑里，而应该作为文本常量注入到 AI 的系统提示中**。这样做的好处是行为规范可以像代码一样被版本控制，也可以被开发者直接阅读理解。
+
+四种类型（user / feedback / project / reference）覆盖了 AI 助手需要跨会话记忆的所有场景，同时通过明确排除列表（`WHAT_NOT_TO_SAVE_SECTION`）防止记忆系统被滥用。
+
+<SourceRef file="source/src/memdir/memoryTypes.ts" lines="1-272" />
+
+<ArticleComplete />

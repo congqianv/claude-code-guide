@@ -1,0 +1,479 @@
+---
+sidebar_position: 5
+title: 如何自定义权限规则：hooks.json 配置详解
+description: 从零开始配置 Claude Code Hooks，包含记录日志、阻止危险操作、发送通知的完整示例
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 如何自定义权限规则：hooks.json 配置详解
+
+<DifficultyBadge level="入门" />
+
+Claude Code 的 Hook 系统允许你在工具执行的关键节点插入自定义逻辑。通过编写 Hook 配置，不需要修改 Claude Code 源码，就能实现：记录审计日志、阻止危险操作、发送通知提醒、集成外部系统等功能。
+
+## 配置文件位置
+
+Hooks 配置不是独立的 `hooks.json` 文件，而是集成在 Claude Code 统一的 `settings.json` 配置文件中，通过 `hooks` 字段定义。
+
+配置文件有三个层级：
+
+### 1. 用户级（全局）
+
+```
+~/.claude/settings.json
+```
+
+对当前用户的所有项目生效。适合配置个人习惯性的安全规则。
+
+### 2. 项目级
+
+```
+<project-root>/.claude/settings.json
+```
+
+只对当前项目生效，可以提交到版本控制，在团队间共享。适合项目特定的工作流 Hook。
+
+### 3. 项目本地级（不提交）
+
+```
+<project-root>/.claude/settings.local.json
+```
+
+只对当前项目生效，但不应提交到版本控制（`.gitignore` 中排除）。适合个人开发习惯配置。
+
+### 4. 插件 Hooks
+
+```
+~/.claude/plugins/*/hooks/hooks.json
+```
+
+由 Claude Code 插件提供的 Hook，只读（不建议手动修改）。
+
+### 优先级顺序
+
+当多个层级都配置了相同事件的 Hook 时，**所有层级的 Hooks 都会执行**（不是覆盖，而是合并）。执行顺序：用户级 → 项目级 → 本地级 → 插件级。
+
+## 配置格式详解
+
+`settings.json` 中 `hooks` 字段的完整结构：
+
+```json
+{
+  "hooks": {
+    "<事件名>": [
+      {
+        "matcher": "<匹配规则（可选）>",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<shell 命令>",
+            "timeout": 30,
+            "if": "<精细化过滤条件（可选）>"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### `matcher` 字段
+
+`matcher` 指定哪些工具触发这条规则。对于 `PreToolUse` 和 `PostToolUse`，matcher 匹配的是工具名（`tool_name`）：
+
+```json
+"matcher": "Bash"       // 只匹配 Bash 工具
+"matcher": "Write"      // 只匹配 Write 工具
+"matcher": ""           // 或不填，匹配所有工具
+```
+
+### `if` 字段（精细化过滤）
+
+`if` 字段支持权限规则语法（Permission Rule Syntax），在 matcher 基础上进一步精确过滤：
+
+```json
+{
+  "type": "command",
+  "command": "...",
+  "if": "Bash(git *)"    // 只对 git 相关命令触发
+}
+```
+
+这个过滤在 Hook 被调用之前就完成，可以减少不必要的子进程启动。
+
+### 支持的 Hook 类型
+
+| 类型 | 说明 |
+|------|------|
+| `command` | 执行 shell 命令（最常用） |
+| `prompt` | 调用 LLM 做判断 |
+| `http` | 发送 HTTP 请求 |
+| `agent` | 启动一个 Agent 做复杂验证 |
+
+## 实际示例 1：记录所有工具调用到日志文件
+
+**需求：** 将每次工具调用（工具名 + 关键参数）记录到审计日志文件。
+
+**配置（`~/.claude/settings.json`）：**
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'echo \"[$(date +%Y-%m-%dT%H:%M:%S)] $(cat)\" >> ~/.claude/audit.log'",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`async: true` 让日志记录在后台进行，不阻塞工具执行。
+
+**效果：** `~/.claude/audit.log` 中会记录如下内容：
+
+```
+[2026-04-01T10:30:45] {"session_id":"abc123","tool_name":"Bash","tool_input":{"command":"ls -la"}}
+[2026-04-01T10:30:47] {"session_id":"abc123","tool_name":"Write","tool_input":{"file_path":"README.md","content":"..."}}
+```
+
+**更精细的日志脚本（`~/.claude/hooks/audit-logger.sh`）：**
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name','?'))")
+TIMESTAMP=$(date +"%Y-%m-%dT%H:%M:%S")
+
+# 只记录写操作
+case "$TOOL" in
+  Write|Edit|MultiEdit|Bash)
+    echo "[$TIMESTAMP] $TOOL: $(echo "$INPUT" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+inp=d.get('tool_input',{})
+if 'command' in inp:
+    print(inp['command'][:100])
+elif 'file_path' in inp:
+    print(inp['file_path'])
+else:
+    print('...')
+")" >> ~/.claude/audit.log
+    ;;
+esac
+exit 0
+```
+
+**配置：**
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/audit-logger.sh",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 实际示例 2：禁止删除某个重要目录
+
+**需求：** 阻止 Claude 删除 `~/important-data/` 目录中的任何文件。
+
+**Hook 脚本（`~/.claude/hooks/protect-important.sh`）：**
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+
+# 提取工具名和命令
+TOOL=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name',''))")
+COMMAND=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('command',''))")
+FILE_PATH=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('file_path',''))")
+
+PROTECTED_DIR="$HOME/important-data"
+
+# 检查 Bash 命令是否涉及受保护目录
+if [ "$TOOL" = "Bash" ]; then
+  if echo "$COMMAND" | grep -q "$PROTECTED_DIR"; then
+    if echo "$COMMAND" | grep -qE '(rm|rmdir|mv|chmod|chown|unlink)'; then
+      echo "禁止操作：不允许在 $PROTECTED_DIR 中执行删除或移动操作" >&2
+      echo "如需修改此目录，请先手动备份，然后联系管理员" >&2
+      exit 2  # 拒绝执行，并将消息发给 Claude
+    fi
+  fi
+fi
+
+# 检查文件写入操作是否涉及受保护目录（理论上 Write 不能删，但可以加检查）
+if [ "$TOOL" = "Write" ] || [ "$TOOL" = "Edit" ]; then
+  case "$FILE_PATH" in
+    "$PROTECTED_DIR"/*)
+      echo "警告：正在尝试修改受保护目录中的文件：$FILE_PATH" >&2
+      echo "此操作已被拦截" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+exit 0
+```
+
+**配置：**
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/protect-important.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/protect-important.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+当 Claude 尝试执行 `rm ~/important-data/backup.tar.gz` 时，Hook 返回 exit code 2，Claude 会收到错误消息并停止操作。
+
+## 实际示例 3：在执行 bash 命令前发送通知
+
+**需求：** 当 Claude 要执行 bash 命令时，通过系统通知提醒用户（macOS）。
+
+**配置（直接在 settings.json 内联命令）：**
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "osascript -e 'display notification \"Claude 正在执行 Bash 命令\" with title \"Claude Code\" sound name \"Ping\"'",
+            "async": true,
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Linux 用户可以使用 `notify-send`：
+
+```json
+{
+  "type": "command",
+  "command": "notify-send 'Claude Code' 'Claude 正在执行 Bash 命令'",
+  "async": true
+}
+```
+
+更高级的通知（包含命令内容）：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+cmd = d.get('tool_input', {}).get('command', '')
+print(cmd[:50] + '...' if len(cmd) > 50 else cmd)
+")
+
+# macOS 通知
+osascript -e "display notification \"${COMMAND}\" with title \"Claude 要执行命令\" subtitle \"点击 Claude Code 查看详情\""
+exit 0
+```
+
+## 常见陷阱和注意事项
+
+### 陷阱 1：忘记让脚本可执行
+
+```bash
+chmod +x ~/.claude/hooks/*.sh
+```
+
+Hook 脚本必须有执行权限，否则会静默失败（取决于 `command` 字段的写法）。
+
+### 陷阱 2：exit code 语义混淆
+
+最容易犯的错误是把 exit code 1 误解为"拒绝"：
+
+```
+exit 0 → 允许（正常情况）
+exit 2 → 拒绝，错误消息发给 Claude
+exit 1（或其他）→ 错误，stderr 只显示给用户，工具继续执行
+```
+
+如果想拒绝工具执行，**必须**使用 exit code 2，不是 1。
+
+### 陷阱 3：同步 Hook 导致卡顿
+
+耗时的操作（如网络请求、复杂计算）应使用 `async: true`：
+
+```json
+{
+  "type": "command",
+  "command": "curl -s https://slack.com/api/chat.postMessage ...",
+  "async": true   // 不要让 Slack 通知阻塞工具执行！
+}
+```
+
+### 陷阱 4：在 Hook 中调用 Claude Code
+
+Hook 脚本不应该反过来调用 `claude` 命令，这会导致递归调用和死锁。
+
+### 陷阱 5：忘记处理特殊字符
+
+Hook 脚本通过 stdin 接收 JSON，当 JSON 包含路径、命令字符串时，要注意正确处理转义：
+
+```bash
+# 错误：直接用 jq 取值并插入 shell 可能导致注入
+DIR=$(echo "$INPUT" | jq -r '.tool_input.file_path')
+ls $DIR  # 危险！
+
+# 正确：引用变量
+ls "$DIR"
+```
+
+### 陷阱 6：超时配置不合理
+
+Hook 的默认超时时间是 60 秒（`command` 类型）。如果你的 Hook 是简单的 bash 脚本，建议设置较短的超时：
+
+```json
+{
+  "type": "command",
+  "command": "bash ~/.claude/hooks/check.sh",
+  "timeout": 5   // 5 秒超时，防止 Hook 卡死影响体验
+}
+```
+
+### 陷阱 7：全局 Hook 影响所有项目
+
+用户级 `~/.claude/settings.json` 中的 Hook 对所有项目生效。如果 Hook 逻辑依赖特定项目路径，应该放在项目级配置中。
+
+## 禁用 Hooks 的方法
+
+在某些场景下，你可能需要临时禁用 Hooks（例如排查问题）：
+
+**通过 settings.json 禁用所有 Hooks：**
+
+```json
+{
+  "hooksConfig": {
+    "disableAllHooks": true
+  }
+}
+```
+
+**仅允许管理员管控的 Hooks：**
+
+```json
+{
+  "hooksConfig": {
+    "allowManagedHooksOnly": true
+  }
+}
+```
+
+这个配置在企业环境中很有用：IT 管理员可以通过 `managed-settings.json` 强制部署 Hook，同时阻止用户添加自定义 Hook。
+
+## 完整配置示例
+
+下面是一个综合性的配置示例，集成了日志记录、安全检查和通知功能：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'echo \"[$(date -Iseconds)] PRE: $(cat)\" >> ~/.claude/audit.log'",
+            "async": true,
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/security-check.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'echo \"[$(date -Iseconds)] POST: $(cat | python3 -c \"import sys,json;d=json.load(sys.stdin);print(d.get(\\\"tool_name\\\",\\\"?\\\"))\")\" >> ~/.claude/audit.log'",
+            "async": true,
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '[$(date -Iseconds)] Session started' >> ~/.claude/audit.log",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+通过 Hooks 系统，Claude Code 的权限控制从"内置规则"扩展到了"用户定义规则"，实现了真正灵活的安全策略定制。
+
+<SourceRef file="source/src/schemas/hooks.ts" lines="29-222" />
+<SourceRef file="source/src/utils/settings/settings.ts" lines="274-306" />
+<SourceRef file="source/src/utils/hooks/hooksConfigManager.ts" lines="26-100" />
+
+<ArticleComplete />

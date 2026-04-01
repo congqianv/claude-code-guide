@@ -1,0 +1,324 @@
+---
+sidebar_position: 7
+title: "工具的并发安全：isConcurrencySafe() 的设计"
+description: 深入分析工具并发安全机制，理解 runTools() 如何基于 isConcurrencySafe() 做调度决策，以及哪些工具可以并行、哪些必须串行
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 工具的并发安全：isConcurrencySafe() 的设计
+
+<DifficultyBadge level="深度" />
+
+当 Claude 在一轮对话中需要同时调用多个工具时，一个关键问题出现了：这些工具调用可以并行执行，还是必须一个接一个？错误的答案轻则结果不正确，重则破坏文件系统。
+
+Claude Code 通过 `isConcurrencySafe()` 方法解决这个问题——每个工具声明自己是否可以并发执行，调度系统据此决定执行策略。
+
+## 什么是并发安全？
+
+**并发安全**（Concurrency Safe）意味着：这个工具的调用不依赖也不修改任何共享可变状态。即使多个实例同时运行，也不会产生竞态条件（race condition）。
+
+在工具系统的语境下，"共享可变状态"主要是指：
+- 文件系统内容
+- 进程工作目录（cwd）
+- 会话上下文（ToolUseContext 中的状态）
+- 外部服务的状态（数据库、API 等）
+
+**只读操作天然是并发安全的**：如果工具只是读取数据而不修改任何状态，多个实例同时运行互不干扰。
+
+## 各工具的并发安全性分析
+
+### 并发安全的工具（isConcurrencySafe = true）
+
+**FileReadTool**
+
+```typescript
+// source/src/tools/FileReadTool/FileReadTool.ts（buildTool 配置）
+isConcurrencySafe() { return true },
+isReadOnly() { return true },
+```
+
+读取文件内容不修改任何状态，多个读取可以安全并行。即使同一个文件被多次读取，也不会有问题。
+
+**GlobTool**
+
+```typescript
+// source/src/tools/GlobTool/GlobTool.ts
+isConcurrencySafe() { return true },
+isReadOnly() { return true },
+```
+
+文件名匹配只涉及目录遍历，纯读取操作。
+
+**GrepTool**
+
+```typescript
+// source/src/tools/GrepTool/GrepTool.ts
+isConcurrencySafe() { return true },
+isReadOnly() { return true },
+```
+
+基于 ripgrep 的内容搜索，只读文件内容，完全并发安全。
+
+**WebFetchTool、WebSearchTool**
+
+网络请求通常是无状态的，可以并行发出多个请求。
+
+### 条件性并发安全：BashTool
+
+BashTool 是最有趣的例子——它的并发安全性依赖于具体命令：
+
+```typescript
+// source/src/tools/BashTool/BashTool.tsx，第 434 行
+isConcurrencySafe(input) {
+  // BashTool 的并发安全性等价于命令是否只读
+  return this.isReadOnly?.(input) ?? false
+},
+
+isReadOnly(input) {
+  const compoundCommandHasCd = commandHasAnyCd(input.command)
+  const result = checkReadOnlyConstraints(input, compoundCommandHasCd)
+  return result.behavior === 'allow'
+},
+```
+
+- `cat file.ts` → `isReadOnly = true` → **并发安全**
+- `ls -la` → `isReadOnly = true` → **并发安全**
+- `git log --oneline` → `isReadOnly = true` → **并发安全**
+- `echo "hello" > file.txt` → `isReadOnly = false` → **非并发安全**
+- `cd /tmp && ls` → `isReadOnly = false`（含 cd）→ **非并发安全**
+
+含 `cd` 的命令被单独列为非并发安全，因为 `cd` 会改变进程工作目录（cwd），而 cwd 是全局共享状态——如果两个并行的 bash 命令同时 `cd` 到不同目录，后续命令的行为就不可预测了。
+
+### 不并发安全的工具
+
+**FileEditTool、FileWriteTool**
+
+```typescript
+// source/src/tools/FileEditTool/FileEditTool.ts（buildTool 配置）
+isConcurrencySafe() { return false },
+isReadOnly() { return false },
+```
+
+文件写入操作不可并发。两个同时写入同一文件的操作会产生竞态条件——最后一个写入者会覆盖另一个的结果，或者更糟，产生损坏的文件内容。
+
+**MCP 工具（默认）**
+
+```typescript
+// MCPTool 包装器中
+isConcurrencySafe() {
+  return false  // 保守默认值：MCP 工具状态未知
+},
+```
+
+由于无法提前知道 MCP 服务器端工具的副作用，默认将所有 MCP 工具标记为非并发安全。这是"fail safe"策略——宁可串行执行损失一点性能，也不冒并发风险。
+
+**AgentTool**
+
+```typescript
+// AgentTool 启动子 agent，子 agent 会修改全局状态
+isConcurrencySafe() { return false },
+```
+
+子 agent 可能写文件、执行命令，不能并发。
+
+## runTools()：调度决策的核心
+
+`source/src/services/tools/toolOrchestration.ts` 中的 `runTools()` 是调度的入口：
+
+```typescript
+// source/src/services/tools/toolOrchestration.ts，第 19 行
+export async function* runTools(
+  toolUseMessages: ToolUseBlock[],
+  assistantMessages: AssistantMessage[],
+  canUseTool: CanUseToolFn,
+  toolUseContext: ToolUseContext,
+): AsyncGenerator<MessageUpdate, void> {
+  let currentContext = toolUseContext
+
+  // 将工具调用分批，每批要么全并发，要么全串行
+  for (const { isConcurrencySafe, blocks } of partitionToolCalls(
+    toolUseMessages,
+    currentContext,
+  )) {
+    if (isConcurrencySafe) {
+      // 并发批次：同时运行所有工具，收集 contextModifier
+      for await (const update of runToolsConcurrently(
+        blocks,
+        assistantMessages,
+        canUseTool,
+        currentContext,
+      )) {
+        // 处理上下文修改器（并发工具不能直接修改共享上下文）
+        if (update.contextModifier && update.toolUseId) {
+          queuedContextModifiers[update.toolUseId] ??= []
+          queuedContextModifiers[update.toolUseId]!.push(update.contextModifier)
+        }
+        if (update.message) yield { message: update.message, newContext: currentContext }
+      }
+      // 批次结束后，按顺序应用所有上下文修改器
+      for (const modifiers of Object.values(queuedContextModifiers)) {
+        for (const modifier of modifiers) {
+          currentContext = modifier(currentContext)
+        }
+      }
+    } else {
+      // 串行批次：逐个执行，每个工具可以立即修改上下文
+      for await (const update of runToolsSerially(
+        blocks,
+        assistantMessages,
+        canUseTool,
+        currentContext,
+      )) {
+        if (update.contextModifier) {
+          currentContext = update.contextModifier(currentContext)
+        }
+        if (update.message) yield { message: update.message, newContext: currentContext }
+      }
+    }
+  }
+}
+```
+
+## partitionToolCalls()：分批策略
+
+```typescript
+// source/src/services/tools/toolOrchestration.ts，第 84 行
+type Batch = { isConcurrencySafe: boolean; blocks: ToolUseBlock[] }
+
+function partitionToolCalls(
+  toolUseMessages: ToolUseBlock[],
+  toolUseContext: ToolUseContext,
+): Batch[] {
+  return toolUseMessages.reduce((acc: Batch[], toolUse) => {
+    const tool = findToolByName(toolUseContext.options.tools, toolUse.name)
+    const parsedInput = tool?.inputSchema.safeParse(toolUse.input)
+
+    // 解析失败或工具不存在时，保守地标记为非并发安全
+    const isConcurrencySafe = parsedInput?.success
+      ? (() => {
+          try {
+            return Boolean(tool?.isConcurrencySafe(parsedInput.data))
+          } catch {
+            // isConcurrencySafe 抛出异常时，保守处理
+            return false
+          }
+        })()
+      : false
+
+    // 连续的并发安全工具合并为一批
+    if (isConcurrencySafe && acc[acc.length - 1]?.isConcurrencySafe) {
+      acc[acc.length - 1]!.blocks.push(toolUse)
+    } else {
+      acc.push({ isConcurrencySafe, blocks: [toolUse] })
+    }
+    return acc
+  }, [])
+}
+```
+
+分批逻辑：**连续的并发安全工具合并为一批并行执行，每个非并发安全工具单独一批串行执行**。
+
+示例分析：
+
+```
+Claude 调用工具序列：
+  [Read(a.ts), Read(b.ts), Glob("*.ts"), Edit(c.ts), Read(d.ts)]
+
+分批结果：
+  批次1: [Read(a.ts), Read(b.ts), Glob("*.ts")]  → isConcurrencySafe=true，并行
+  批次2: [Edit(c.ts)]                             → isConcurrencySafe=false，串行
+  批次3: [Read(d.ts)]                             → isConcurrencySafe=true，并行（但只有一个）
+
+执行顺序：
+  批次1 中的三个工具同时开始执行
+  等待批次1全部完成
+  批次2 的 Edit 执行（包含用户确认）
+  批次2 完成后，批次3 执行
+```
+
+## 竞态条件的实际例子
+
+假设并发安全检查被绕过（或者错误地将写操作标记为并发安全），会发生什么？
+
+**场景：两个 FileEdit 同时修改同一文件**
+
+```
+时间线：
+t=0: Edit1 读取文件内容 "function foo() { return 1; }"
+t=0: Edit2 读取文件内容 "function foo() { return 1; }"
+t=1: Edit1 找到 "return 1" 并替换为 "return 2"
+t=1: Edit2 找到 "return 1" 并替换为 "return 3"
+t=2: Edit1 写入新内容 "function foo() { return 2; }"
+t=2: Edit2 写入新内容 "function foo() { return 3; }"
+
+最终结果：
+  文件内容随机取决于哪个写操作最后完成
+  一个修改会覆盖另一个，没有合并
+```
+
+这是经典的"最后写入者胜"（Last Write Wins）竞态，会导致一处代码修改被悄悄丢弃。
+
+**场景：BashTool cd 与其他操作并发**
+
+```
+时间线：
+t=0: Bash1 执行 "cd /tmp && ls"  （改变 cwd 到 /tmp）
+t=0: Bash2 执行 "ls"             （基于原来的 cwd）
+t=1: Bash1 完成，cwd 变为 /tmp
+t=1: Bash2 完成，但在哪个目录执行的 ls？不确定！
+```
+
+这是为什么包含 `cd` 的命令要标记为非并发安全的原因——它改变了其他工具依赖的全局状态。
+
+## contextModifier：并发工具安全修改上下文的机制
+
+并发工具不能直接修改 `ToolUseContext`，因为这是共享状态。但有些工具需要在执行后更新上下文（比如更新文件读取缓存）。
+
+解决方案是 `contextModifier` 回调：
+
+```typescript
+// ToolResult 的定义（Tool.ts）
+export type ToolResult<T> = {
+  data: T
+  newMessages?: Message[]
+  // contextModifier 只对非并发安全的工具有效
+  contextModifier?: (context: ToolUseContext) => ToolUseContext
+}
+```
+
+注释特别说明：`contextModifier is only honored for tools that aren't concurrency safe`。
+
+并发工具的 `contextModifier` 不会被立即应用——而是被收集起来，等整个并发批次完成后，**按工具调用顺序**逐个应用。这保证了上下文更新的确定性，即使工具本身是乱序完成的。
+
+## 并发上限
+
+```typescript
+// source/src/services/tools/toolOrchestration.ts（getMaxToolUseConcurrency 函数）
+function getMaxToolUseConcurrency(): number {
+  // 环境变量可以覆盖默认值
+  const envValue = parseInt(process.env.CLAUDE_CODE_MAX_TOOL_CONCURRENCY || '', 10)
+  if (!isNaN(envValue) && envValue > 0) return envValue
+  return 10  // 默认最多 10 个工具并发
+}
+```
+
+并发工具通过 `all()` 函数执行，这是对 `Promise.all` 的包装，限制了同时进行的最大工具数（默认 10）。这防止了在有大量并发安全工具时创建过多并发 I/O 操作。
+
+## 设计总结
+
+`isConcurrencySafe()` 的设计体现了**"工具自声明，调度器自决策"**的原则：
+
+1. **工具是领域专家**：只有工具自己知道它的副作用，所以并发安全性由工具声明
+2. **调度器是策略执行者**：`runTools()` 根据声明自动决定并行还是串行，用户无感知
+3. **保守 fallback**：任何不确定性（解析失败、异常）都导致串行执行，宁慢勿错
+4. **性能与安全兼顾**：只读操作自动并行（性能），写操作自动串行（安全）
+
+这个设计让 Claude 在调用多个读取工具时自动获得并发加速，同时保证写操作的确定性——无需 Claude 自己管理并发，也无需用户配置。
+
+<SourceRef file="source/src/services/tools/toolOrchestration.ts" lines="1-200" />
+<SourceRef file="source/src/Tool.ts" lines="400-430" />
+
+<ArticleComplete />

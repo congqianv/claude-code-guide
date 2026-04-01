@@ -1,0 +1,325 @@
+---
+sidebar_position: 5
+title: 团队记忆：teamMemPaths.ts / teamMemPrompts.ts 多人共享记忆机制
+description: 解析 Claude Code 团队记忆的路径管理、安全验证与提示构建机制
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 团队记忆：teamMemPaths.ts / teamMemPrompts.ts 多人共享记忆机制
+
+<DifficultyBadge level="进阶" />
+
+## 团队记忆的使用场景
+
+想象这个场景：
+
+- 张三告诉 Claude："我们团队不用 Jest，用 Vitest，因为项目已经全面迁移了"
+- 没有团队记忆时：这条信息只保存在张三的个人记忆里，李四用 Claude Code 时还会被建议用 Jest
+- 有团队记忆后：这条信息保存在共享记忆中，所有团队成员的 Claude Code 都会遵守这个约定
+
+团队记忆（TEAMMEM）解决的是**团队层面的知识共享**问题，让 AI 助手在整个团队中保持一致的行为约定。
+
+典型的团队记忆内容：
+- 测试策略（"用真实 DB，不 mock"）
+- 构建不变量（"PR 必须通过 CI 才能合并"）
+- 项目决策背景（"用 bun 而不是 npm，因为更快"）
+- 外部资源指针（"bug 在 Linear INGEST 项目追踪"）
+- 当前项目里程碑（"4 月 30 日前完成认证重写"）
+
+## 团队记忆的存储位置
+
+```typescript
+// source/src/memdir/teamMemPaths.ts
+export function getTeamMemPath(): string {
+  return (join(getAutoMemPath(), 'team') + sep).normalize('NFC')
+}
+
+export function getTeamMemEntrypoint(): string {
+  return join(getAutoMemPath(), 'team', 'MEMORY.md')
+}
+```
+
+团队记忆是个人记忆目录的**子目录**：
+
+```
+~/.claude/projects/<项目键>/memory/
+├── MEMORY.md                    # 个人记忆索引
+├── user_role.md                 # 个人记忆文件
+├── feedback_no_mock.md          # 个人反馈记忆
+└── team/                        # 团队记忆子目录
+    ├── MEMORY.md               # 团队记忆索引（同步来的）
+    ├── team_test_policy.md     # 团队测试策略
+    └── team_reference_linear.md # 团队外部资源指针
+```
+
+为什么团队记忆存在本地目录而不是直接存在代码仓库里？这是个有趣的设计决策：
+
+1. **代码仓库不总是可写的**（只读克隆、权限限制）
+2. **记忆内容可能包含敏感信息**（虽然系统禁止在团队记忆中存 API key，但额外隔离更安全）
+3. **同步机制可以精细控制**（何时同步、同步哪些文件由专门的 sync 组件控制）
+
+实际上，团队记忆通过**服务端同步**在团队成员间共享，而不是直接读写 Git 仓库。
+
+## isTeamMemoryEnabled：功能启用判断
+
+```typescript
+// source/src/memdir/teamMemPaths.ts
+export function isTeamMemoryEnabled(): boolean {
+  if (!isAutoMemoryEnabled()) {
+    return false
+  }
+  return getFeatureValue_CACHED_MAY_BE_STALE('tengu_herring_clock', false)
+}
+```
+
+团队记忆需要两个条件同时满足：
+1. 自动记忆整体未禁用（`isAutoMemoryEnabled()`）
+2. 通过 GrowthBook feature flag `tengu_herring_clock` 启用
+
+这个 flag 默认为 `false`，意味着团队记忆是**选择性启用**的功能，不是所有用户默认都有。
+
+## teamMemPaths.ts：安全路径管理的核心
+
+`teamMemPaths.ts` 的代码量远超"路径工具"该有的复杂度，原因是团队记忆目录是一个**可写的、用户控制的目录**，存在被恶意利用的风险。
+
+### 威胁模型
+
+如果一个恶意的项目目录里有一个 `symlink` 指向 `~/.ssh/authorized_keys`，而团队记忆系统不检查 symlink，那么：
+1. AI 被指示"保存这条记忆到 team 目录下的 xxx 文件"
+2. xxx 文件实际上是 symlink，指向 `~/.ssh/authorized_keys`
+3. Write 工具会覆盖 SSH 授权密钥
+
+`teamMemPaths.ts` 通过多层防护阻止这类攻击：
+
+### 第一层：sanitizePathKey（键名净化）
+
+```typescript
+function sanitizePathKey(key: string): string {
+  // 拒绝 null 字节（可在 C 系统调用中截断路径）
+  if (key.includes('\0')) throw new PathTraversalError(...)
+
+  // 拒绝 URL 编码的路径穿越（%2e%2e%2f = ../）
+  let decoded: string
+  try { decoded = decodeURIComponent(key) } catch { decoded = key }
+  if (decoded !== key && (decoded.includes('..') || decoded.includes('/'))) {
+    throw new PathTraversalError(...)
+  }
+
+  // 拒绝 Unicode 规范化攻击（全角 ．．／ 在 NFKC 下变成 ../）
+  const normalized = key.normalize('NFKC')
+  if (normalized !== key && (normalized.includes('..') || ...)) {
+    throw new PathTraversalError(...)
+  }
+
+  // 拒绝反斜杠（Windows 路径分隔符用作穿越）
+  if (key.includes('\\')) throw new PathTraversalError(...)
+
+  // 拒绝绝对路径
+  if (key.startsWith('/')) throw new PathTraversalError(...)
+
+  return key
+}
+```
+
+这里覆盖了四种路径注入向量：null 字节、URL 编码、Unicode 规范化攻击、反斜杠。注释中有安全工单编号（PSR M22187），说明这些检查来自具体的安全审计。
+
+### 第二层：realpathDeepestExisting（真实路径解析）
+
+这是整个文件最复杂的函数，处理的是"目标文件可能还不存在"的 symlink 检测问题：
+
+```typescript
+async function realpathDeepestExisting(absolutePath: string): Promise<string> {
+  const tail: string[] = []
+  let current = absolutePath
+
+  for (let parent = dirname(current); current !== parent; parent = dirname(current)) {
+    try {
+      const realCurrent = await realpath(current)
+      // 找到最深的已存在祖先，重组路径
+      return tail.length === 0
+        ? realCurrent
+        : join(realCurrent, ...tail.reverse())
+    } catch (e: unknown) {
+      const code = getErrnoCode(e)
+      if (code === 'ENOENT') {
+        // 可能是悬空 symlink（目标不存在的 symlink）
+        try {
+          const st = await lstat(current)
+          if (st.isSymbolicLink()) {
+            throw new PathTraversalError(`Dangling symlink detected: "${current}"`)
+          }
+        } catch (lstatErr: unknown) {
+          if (lstatErr instanceof PathTraversalError) throw lstatErr
+        }
+      } else if (code === 'ELOOP') {
+        // symlink 环
+        throw new PathTraversalError(`Symlink loop detected: "${current}"`)
+      }
+      // 走到父目录继续
+      tail.push(current.slice(parent.length + sep.length))
+      current = parent
+    }
+  }
+  return absolutePath
+}
+```
+
+这个函数处理了一个棘手场景：`realpath()` 只能解析**已存在**的路径，但我们要写入的目标文件可能还不存在。解决方案是逐级向上找到最深的已存在祖先，对该祖先调用 `realpath()` 解析 symlink，再把不存在的路径尾缀拼接回去。
+
+特别处理了**悬空 symlink**：一个 symlink 文件存在但其目标不存在时，`realpath()` 返回 `ENOENT`，但 `lstat()` 会成功（返回 symlink 条目本身的信息）。用 `lstat` 区分"真的不存在"和"悬空 symlink"，后者要拒绝。
+
+### 第三层：validateTeamMemWritePath（写路径验证）
+
+```typescript
+export async function validateTeamMemWritePath(filePath: string): Promise<string> {
+  if (filePath.includes('\0')) throw new PathTraversalError(...)
+
+  // 第一关：字符串层面路径解析 + 包含性检查
+  const resolvedPath = resolve(filePath)
+  const teamDir = getTeamMemPath()
+  if (!resolvedPath.startsWith(teamDir)) {
+    throw new PathTraversalError(`Path escapes team memory directory: "${filePath}"`)
+  }
+
+  // 第二关：真实文件系统层面 symlink 解析 + 包含性检查
+  const realPath = await realpathDeepestExisting(resolvedPath)
+  if (!(await isRealPathWithinTeamDir(realPath))) {
+    throw new PathTraversalError(`Path escapes team memory directory via symlink: "${filePath}"`)
+  }
+
+  return resolvedPath
+}
+```
+
+两关验证：
+1. `path.resolve()` 消除 `..` 穿越，字符串层面检查包含性
+2. `realpathDeepestExisting()` 解析 symlink，文件系统层面检查包含性
+
+注释特别指出：`path.resolve()` **不解析 symlink**，所以第一关无法防止 symlink 逃逸攻击，必须有第二关。
+
+## teamMemPrompts.ts：联合模式提示构建
+
+当团队记忆启用时，系统提示从"个人记忆"提示切换为"联合记忆"提示：
+
+```typescript
+// source/src/memdir/teamMemPrompts.ts
+export function buildCombinedMemoryPrompt(
+  extraGuidelines?: string[],
+  skipIndex = false,
+): string {
+  const autoDir = getAutoMemPath()
+  const teamDir = getTeamMemPath()
+
+  const lines = [
+    '# Memory',
+    '',
+    `You have a persistent, file-based memory system with two directories: ` +
+    `a private directory at \`${autoDir}\` and a shared team directory at \`${teamDir}\`. ` +
+    `${DIRS_EXIST_GUIDANCE}`,
+    '',
+    // ...
+    '## Memory scope',
+    '',
+    'There are two scope levels:',
+    '',
+    `- private: memories that are private between you and the current user. ...`,
+    `- team: memories that are shared with and contributed by all of the users who work within this project directory. ...`,
+    '',
+    ...TYPES_SECTION_COMBINED,  // 含 scope 标签的类型定义
+    ...WHAT_NOT_TO_SAVE_SECTION,
+    '- You MUST avoid saving sensitive data within shared team memories. For example, never save API keys or user credentials.',
+    // ...
+  ]
+}
+```
+
+联合模式与个人模式的主要区别：
+
+1. **双目录说明**：明确告知 AI 有两个目录（private 和 team），各自的路径
+2. **scope 分类**：使用 `TYPES_SECTION_COMBINED`（含 `<scope>` 标签），指导 AI 判断哪类记忆该放个人目录、哪类该放团队目录
+3. **安全约束**：明确禁止在团队记忆中存储敏感数据（API key、凭证）
+4. **索引双份**：提示中说明"两个 `MEMORY.md` 索引都会加载到上下文"
+
+### scope 的决策矩阵
+
+联合模式中，每种记忆类型都有明确的 scope 建议：
+
+| 类型 | scope 建议 | 理由 |
+|------|-----------|------|
+| user | always private | 用户画像是个人信息 |
+| feedback | default private，明确是项目规范时才 team | 区分个人偏好与团队约定 |
+| project | strongly bias team | 项目状态是共享知识 |
+| reference | usually team | 外部资源位置是共享知识 |
+
+对于 `feedback` 类型，scope 判断最为微妙：
+
+> Save as team only when the guidance is clearly a project-wide convention that every contributor should follow (e.g., a testing policy, a build invariant), not a personal style preference.
+
+"不要在每个回答末尾加总结段落"是个人偏好 → private；"集成测试不得 mock 数据库"是项目规范 → team。
+
+### 保存两步流程的双目录版本
+
+```
+**Step 1** — write the memory to its own file in the chosen directory
+(private or team, per the type's scope guidance)...
+
+**Step 2** — add a pointer to that file in the same directory's MEMORY.md.
+Each directory (private and team) has its own MEMORY.md index...
+```
+
+每个目录都有自己独立的 `MEMORY.md` 索引，保存记忆时需要：
+1. 判断 scope（private or team）
+2. 写记忆文件到对应目录
+3. 更新对应目录的 `MEMORY.md` 索引
+
+## 与个人记忆的关系
+
+团队记忆与个人记忆的关键隔离点：
+
+| 维度 | 个人记忆 | 团队记忆 |
+|------|---------|---------|
+| 存储路径 | `memory/*.md` | `memory/team/*.md` |
+| 可见范围 | 仅当前用户 | 项目内所有用户 |
+| 写入安全检查 | 基本路径检查 | 多层 symlink 防护 |
+| 敏感数据 | 允许（个人信息） | 明确禁止 |
+| 同步方式 | 无需同步 | 服务端同步 |
+| 索引文件 | `MEMORY.md` | `team/MEMORY.md` |
+
+`isTeamMemFile` 函数提供了统一的判断接口：
+
+```typescript
+export function isTeamMemFile(filePath: string): boolean {
+  return isTeamMemoryEnabled() && isTeamMemPath(filePath)
+}
+```
+
+这个函数在写操作权限检查时使用：团队记忆目录下的文件会走特殊的安全验证路径。
+
+## 冲突处理
+
+当个人 feedback 记忆与团队 feedback 记忆冲突时怎么办？源码中有明确的指导：
+
+> Before saving a private feedback memory, check that it doesn't contradict a team feedback memory — if it does, either don't save it or note the override explicitly.
+
+例如：团队记忆说"用 Vitest"，而个人用户说"我在这个项目里还是用 Jest"。处理方式：
+- 要么不保存个人记忆（团队规范优先）
+- 要么保存但明确标注"覆盖团队规范，仅对此用户生效"
+
+## 小结
+
+团队记忆系统展示了一个**在共享写入场景下工程安全性**的典型案例：
+
+1. **功能层面**：用 scope 分类指导 AI 做出正确的记忆归属决策
+2. **存储层面**：团队目录作为个人目录的子目录，统一管理
+3. **安全层面**：多层路径验证防止 symlink 逃逸、路径穿越等攻击
+4. **提示层面**：联合模式提示清晰说明两个目录的用途和边界
+
+安全代码的比例占了 `teamMemPaths.ts` 的大半篇幅，这反映了一个现实：在 AI 可以自主写入文件系统的系统中，**信任边界的验证必须非常严格**，不能依赖 AI 的"自觉"来避免安全问题。
+
+<SourceRef file="source/src/memdir/teamMemPaths.ts" lines="1-293" />
+<SourceRef file="source/src/memdir/teamMemPrompts.ts" lines="1-100" />
+
+<ArticleComplete />

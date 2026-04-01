@@ -1,0 +1,341 @@
+---
+sidebar_position: 4
+title: Hooks 系统与权限联动：pre_tool_use / post_tool_use 拦截
+description: 深度解析 Claude Code 的 Hook 系统如何在工具执行前后进行拦截、修改和控制
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Hooks 系统与权限联动：pre_tool_use / post_tool_use 拦截
+
+<DifficultyBadge level="深度" />
+
+Claude Code 的 Hook 系统是权限控制的"外部扩展点"。通过配置 Hooks，用户可以在工具执行的关键节点插入自定义逻辑——不仅可以记录日志、发送通知，还可以**修改工具输入**甚至**阻止工具执行**。
+
+## Hooks 系统概览
+
+Hook 系统定义在 `source/src/utils/hooks.ts`（2000+ 行）和 `source/src/utils/hooks/` 目录中。所有 Hook 事件类型定义在 `source/src/utils/hooks/hooksConfigManager.ts` 里。
+
+Hook 支持的所有事件类型（`HookEvent`）包括：
+
+| 事件名 | 触发时机 |
+|--------|---------|
+| `PreToolUse` | 工具执行前 |
+| `PostToolUse` | 工具成功执行后 |
+| `PostToolUseFailure` | 工具执行失败后 |
+| `PermissionDenied` | 权限被拒绝后 |
+| `SessionStart` | 新会话开始时 |
+| `SessionEnd` | 会话结束时 |
+| `Stop` | Claude 即将结束本轮回复前 |
+| `PreCompact` | 上下文压缩前 |
+| `PostCompact` | 上下文压缩后 |
+| `UserPromptSubmit` | 用户提交 prompt 时 |
+| `PermissionRequest` | 权限对话框显示时 |
+| `Setup` | 仓库初始化/维护时 |
+| `Notification` | 发送通知时 |
+
+本文重点讲解与权限联动最紧密的两个：`PreToolUse` 和 `PostToolUse`。
+
+## PreToolUse：工具执行前的拦截
+
+`PreToolUse` 是权限系统中最重要的 Hook，它在工具实际执行之前触发，具备以下能力：
+
+**输入数据格式：**
+
+Hook 脚本通过标准输入（stdin）接收 JSON 格式的工具调用信息：
+
+```json
+{
+  "session_id": "abc123",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf /tmp/test"
+  }
+}
+```
+
+**Exit Code 语义：**
+
+```
+Exit Code 0   → 允许工具执行（stdout/stderr 不显示）
+Exit Code 2   → 拒绝工具执行，将 stderr 内容发给 Claude 作为错误消息
+其他 Exit Code → 仅将 stderr 显示给用户，但继续执行工具
+```
+
+这是最核心的设计：**exit code 2 是"否决权"**，会将 stderr 的内容作为错误消息反馈给 Claude，让 Claude 可以了解为什么被阻止，并可能调整策略重试。
+
+```typescript
+// source/src/utils/hooks/hooksConfigManager.ts
+PreToolUse: {
+  summary: 'Before tool execution',
+  description:
+    'Input to command is JSON of tool call arguments.\n' +
+    'Exit code 0 - stdout/stderr not shown\n' +
+    'Exit code 2 - show stderr to model and block tool call\n' +
+    'Other exit codes - show stderr to user only but continue with tool call',
+  matcherMetadata: {
+    fieldToMatch: 'tool_name',
+    values: toolNames,
+  },
+},
+```
+
+**Hook 的 matcher 机制：**
+
+每个 Hook 配置都有一个可选的 `matcher` 字段，用于过滤只对哪些工具触发：
+
+```json
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [{ "type": "command", "command": "echo 检测到 Bash 调用" }]
+    }
+  ]
+}
+```
+
+Matcher 支持精确匹配工具名，如 `Bash`、`Write`、`Edit` 等。不填 matcher 则对所有工具触发。
+
+## PostToolUse：工具执行后的观察
+
+`PostToolUse` 在工具成功执行后触发，可以观察执行结果。
+
+**输入数据格式：**
+
+```json
+{
+  "session_id": "abc123",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/tmp/output.txt",
+    "content": "Hello World"
+  },
+  "tool_response": {
+    "content": "File written successfully"
+  }
+}
+```
+
+**Exit Code 语义：**
+
+```
+Exit Code 0   → 将 stdout 显示在 transcript 模式（Ctrl+O 查看）
+Exit Code 2   → 将 stderr 立即发给 Claude（类似反馈/建议）
+其他 Exit Code → 仅将 stderr 显示给用户
+```
+
+注意 `PostToolUse` 中 exit code 2 的语义：它**不能阻止**已经执行完的工具，但可以向 Claude 发送后续指令（"刚才的文件写入有问题，请检查..."）。
+
+## Hook 的四种实现类型
+
+从 `source/src/schemas/hooks.ts` 可以看出，Hook 支持四种实现方式：
+
+### 1. Command Hook（Shell 命令）
+
+最常用的类型，执行 shell 脚本：
+
+```json
+{
+  "type": "command",
+  "command": "python3 /path/to/security-check.py",
+  "timeout": 30,
+  "shell": "bash"
+}
+```
+
+特殊参数：
+- `timeout`：超时时间（秒）
+- `shell`：使用 `bash` 或 `powershell`
+- `async`：是否后台异步执行
+- `asyncRewake`：异步执行，exit code 2 时唤醒 Claude
+- `once`：只执行一次后自动移除
+
+### 2. Prompt Hook（LLM 提示）
+
+让 Claude 本身来做判断的 Hook：
+
+```json
+{
+  "type": "prompt",
+  "prompt": "检查以下工具调用是否安全：$ARGUMENTS",
+  "model": "claude-haiku-4-6"
+}
+```
+
+`$ARGUMENTS` 会被替换为 Hook 输入的 JSON 字符串。这本质上是让一个小模型来做安全审计。
+
+### 3. HTTP Hook（HTTP 请求）
+
+调用外部 API 或服务：
+
+```json
+{
+  "type": "http",
+  "url": "https://security.example.com/audit",
+  "headers": {
+    "Authorization": "Bearer $API_TOKEN"
+  },
+  "allowedEnvVars": ["API_TOKEN"]
+}
+```
+
+注意 `allowedEnvVars`：为了安全，只有明确列出的环境变量名才会被插值到 header 中。
+
+### 4. Agent Hook（Agent 验证器）
+
+用一个完整的 Agent 来做复杂验证：
+
+```json
+{
+  "type": "agent",
+  "prompt": "验证刚才执行的测试是否全部通过，检查 test.log 文件内容。",
+  "timeout": 60
+}
+```
+
+这是权限系统中最强大（也最昂贵）的 Hook 类型，适合复杂的验证场景。
+
+## Hook 与权限决策的联动
+
+Hook 并不只是被动的观察者。`PermissionRequest` 事件专门设计了 Hook 可以影响权限决策的机制：
+
+```typescript
+// source/src/utils/hooks/hooksConfigManager.ts
+PermissionRequest: {
+  summary: 'When a permission dialog is displayed',
+  description:
+    'Input to command is JSON with tool_name, tool_input, and tool_use_id.\n' +
+    'Output JSON with hookSpecificOutput containing decision to allow or deny.\n' +
+    'Exit code 0 - use hook decision if provided\n' +
+    'Other exit codes - show stderr to user only',
+}
+```
+
+通过 `PermissionRequest` Hook，可以让外部脚本自动做出权限决策（允许或拒绝），从而**完全绕过 UI 对话框**。Hook 脚本在 stdout 中输出 JSON：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "permissionDecision": "allow"
+  }
+}
+```
+
+## 实际示例：用 Hook 阻止危险命令
+
+下面是一个实际可用的 `PreToolUse` Hook，用于阻止包含 `rm -rf /` 的危险命令：
+
+**Hook 脚本（`~/.claude/hooks/check-dangerous.sh`）：**
+
+```bash
+#!/bin/bash
+# 读取 stdin 中的工具调用 JSON
+INPUT=$(cat)
+
+# 提取工具名和命令内容
+TOOL_NAME=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name',''))")
+COMMAND=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('command',''))")
+
+# 只检查 Bash 工具
+if [ "$TOOL_NAME" != "Bash" ]; then
+  exit 0  # 其他工具直接放行
+fi
+
+# 检测危险模式
+if echo "$COMMAND" | grep -qE 'rm\s+-rf\s+/|rm\s+--recursive\s+--force\s+/'; then
+  echo "检测到危险命令：$COMMAND" >&2
+  echo "禁止对根目录执行递归删除操作" >&2
+  exit 2  # 拒绝执行，并将消息发给 Claude
+fi
+
+exit 0  # 正常放行
+```
+
+**配置（`~/.claude/settings.json`）：**
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/check-dangerous.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+当 Claude 尝试执行 `rm -rf /tmp` 时：
+1. `PreToolUse` Hook 脚本被调用，stdin 收到 JSON
+2. 脚本分析命令内容
+3. 如果匹配危险模式，输出错误消息到 stderr，返回 exit code 2
+4. Claude Code 阻止命令执行，将 stderr 内容作为错误反馈给 Claude
+5. Claude 收到"检测到危险命令"的错误信息，会调整策略
+
+## Function Hook：程序化 Hooks
+
+除了 shell 命令，还有一种"函数 Hook"（`FunctionHook`），定义在 `source/src/utils/hooks/sessionHooks.ts` 中：
+
+```typescript
+export type FunctionHookCallback = (
+  messages: Message[],
+  signal?: AbortSignal,
+) => boolean | Promise<boolean>
+
+export type FunctionHook = {
+  type: 'function'
+  id?: string
+  timeout?: number
+  callback: FunctionHookCallback  // TypeScript 函数，非 shell 命令
+  errorMessage: string
+}
+```
+
+函数 Hook 是**会话级别（session-scoped）的内存 Hook**，不能持久化到配置文件，只能在代码中通过 `addFunctionHook` / `removeFunctionHook` 动态注册。
+
+```typescript
+// 动态注册函数 Hook
+addFunctionHook(
+  setAppState,
+  sessionId,
+  'PreToolUse',
+  'Bash',  // matcher
+  async (messages, signal) => {
+    // 返回 true = 允许，false = 阻止
+    const lastMsg = messages[messages.length - 1]
+    return !isSuspicious(lastMsg)
+  },
+  '检测到可疑操作，已阻止'
+)
+```
+
+这种机制主要供内部组件（如 Workflow 引擎）使用，不面向最终用户。
+
+## Hook 的执行模型
+
+Hook 脚本是在子进程中执行的，和 Claude Code 主进程通过 stdin/stdout/stderr + exit code 通信。
+
+关键实现细节：
+- Hook 超时后不会导致整个会话崩溃，而是被安全地终止
+- `async` Hook 在后台执行，不阻塞工具调用
+- `asyncRewake` Hook 在后台执行，exit code 2 时触发"唤醒 Claude"（向 Claude 发送通知）
+- Hook 错误会被捕获并显示，而不会终止会话
+
+这种设计确保了 Hook 系统的**健壮性**：即使 Hook 脚本出错，Claude Code 本身也能正常继续运行。
+
+<SourceRef file="source/src/utils/hooks/hooksConfigManager.ts" lines="26-178" />
+<SourceRef file="source/src/utils/hooks/sessionHooks.ts" lines="1-115" />
+<SourceRef file="source/src/schemas/hooks.ts" lines="29-220" />
+
+<ArticleComplete />

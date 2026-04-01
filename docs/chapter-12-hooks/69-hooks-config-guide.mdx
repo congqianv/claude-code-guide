@@ -1,0 +1,487 @@
+---
+sidebar_position: 9
+title: "hooks.json 配置详解：如何编写自定义 Hook"
+description: 完整的 hooks.json 配置指南，包含 5 个即用示例：日志、安全检查、通知、数据备份与代码质量
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# hooks.json 配置详解：如何编写自定义 Hook
+
+<DifficultyBadge level="入门" />
+
+## 配置文件的位置
+
+Claude Code 从三个位置读取 Hook 配置，按作用范围由大到小：
+
+| 文件路径 | 作用范围 | 适用场景 |
+|---------|---------|---------|
+| `~/.claude/settings.json` | 全局（所有项目） | 个人工作流偏好 |
+| `.claude/settings.json` | 项目级（随代码提交） | 团队共享的检查规则 |
+| `.claude/settings.local.json` | 本地覆盖（不提交） | 个人的临时调试钩子 |
+
+**重要**：Hook 配置放在 `settings.json` 文件的 `hooks` 字段中，而非单独的 `hooks.json` 文件（"hooks.json"是通俗说法）。
+
+## 完整配置格式
+
+```json
+{
+  "hooks": {
+    "<HookEvent>": [
+      {
+        "matcher": "<匹配字符串（可选）>",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<要执行的 shell 命令>",
+            "timeout": 30,
+            "statusMessage": "执行中...",
+            "once": false,
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### 字段说明
+
+**顶层 `hooks` 对象：**
+- key 是 Hook 事件名称（`PreToolUse`、`PostToolUse` 等）
+- value 是 HookMatcher 数组
+
+**HookMatcher 对象：**
+- `matcher`（可选）：工具名称匹配字符串（精确匹配或 glob 模式），省略表示匹配所有
+- `hooks`：HookCommand 数组，按顺序执行
+
+**HookCommand 对象（type: "command"）：**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `type` | `"command"` | 是 | 指定为 shell 命令类型 |
+| `command` | string | 是 | 要执行的 shell 命令 |
+| `timeout` | number | 否 | 超时秒数（默认 600 秒） |
+| `shell` | `"bash"` \| `"powershell"` | 否 | shell 类型（默认 bash） |
+| `statusMessage` | string | 否 | 执行时显示的 spinner 文字 |
+| `once` | boolean | 否 | true=执行一次后自动移除 |
+| `async` | boolean | 否 | true=在后台异步执行 |
+| `asyncRewake` | boolean | 否 | true=后台执行且 exit 2 时唤醒 Claude |
+| `if` | string | 否 | 条件过滤（权限规则语法） |
+
+## 5 个实用 Hook 示例
+
+### 示例 1：操作审计日志
+
+记录所有工具调用到日志文件，适合需要审计的场景：
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -cn --arg ts \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" --argjson input \"$(cat)\" '{timestamp: $ts, event: $input}' >> ~/.claude/audit.jsonl",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+配套的日志查看命令：
+```bash
+# 查看最近 10 条审计记录
+tail -10 ~/.claude/audit.jsonl | jq '{tool: .event.tool_name, cmd: .event.tool_input.command}'
+
+# 按工具统计今日调用次数
+cat ~/.claude/audit.jsonl | jq -r '.event.tool_name' | sort | uniq -c | sort -rn
+```
+
+### 示例 2：安全检查（阻止危险操作）
+
+防止执行高风险的 Bash 命令：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/security-check.sh",
+            "timeout": 5,
+            "statusMessage": "安全检查..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# ~/.claude/hooks/security-check.sh
+
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# 危险命令模式列表
+DANGEROUS_PATTERNS=(
+  "rm -rf /"
+  "rm -rf ~"
+  "dd if=/dev/random"
+  "mkfs\."
+  "> /dev/sda"
+  "chmod -R 777 /"
+  "sudo rm -rf"
+)
+
+for pattern in "${DANGEROUS_PATTERNS[@]}"; do
+  if echo "$COMMAND" | grep -qE "$pattern"; then
+    echo "安全策略阻止了危险命令: $COMMAND" >&2
+    echo "匹配的危险模式: $pattern" >&2
+    exit 2  # 阻断，stderr 展示给 Claude
+  fi
+done
+
+# 检查是否尝试修改 ~/.ssh/
+if echo "$COMMAND" | grep -q "~/.ssh/\|\.ssh/authorized_keys"; then
+  echo "安全警告：检测到对 SSH 配置的修改尝试" >&2
+  exit 2
+fi
+
+exit 0  # 通过检查
+```
+
+### 示例 3：桌面通知
+
+当 Claude 完成一轮工作（`Stop` 事件）时发送系统通知：
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/notify.sh",
+            "async": true,
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# ~/.claude/hooks/notify.sh - 跨平台通知脚本
+
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id' | cut -c1-8)
+
+# macOS
+if command -v osascript &>/dev/null; then
+  osascript -e "display notification \"Claude Code 完成了任务\" with title \"Claude Code [$SESSION_ID]\" sound name \"Glass\""
+  exit 0
+fi
+
+# Linux（需要 libnotify）
+if command -v notify-send &>/dev/null; then
+  notify-send "Claude Code" "任务完成 [$SESSION_ID]" --icon=dialog-information
+  exit 0
+fi
+
+# Windows（WSL 环境）
+if command -v powershell.exe &>/dev/null; then
+  powershell.exe -Command "
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show('Claude Code 完成了任务', 'Claude Code')
+  " 2>/dev/null
+fi
+```
+
+### 示例 4：代码提交前数据备份
+
+在 Claude 执行 `git commit` 之前，自动备份关键数据文件：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/backup-before-commit.sh",
+            "if": "Bash(git commit*)",
+            "timeout": 30,
+            "statusMessage": "备份数据..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# ~/.claude/hooks/backup-before-commit.sh
+
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+
+# 只处理 git commit 命令
+if ! echo "$COMMAND" | grep -q "git commit"; then
+  exit 0
+fi
+
+cd "$CWD"
+
+# 备份数据库文件（如果存在）
+BACKUP_DIR=".backups/$(date +%Y%m%d)"
+mkdir -p "$BACKUP_DIR"
+
+for DB_FILE in *.sqlite *.db data/*.json; do
+  if [ -f "$DB_FILE" ]; then
+    cp "$DB_FILE" "$BACKUP_DIR/"
+    echo "已备份: $DB_FILE → $BACKUP_DIR/"
+  fi
+done
+
+exit 0  # 继续 git commit
+```
+
+### 示例 5：自动代码质量检查
+
+在文件写入后自动运行 linter，并将结果注入给 Claude：
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/lint-check.sh",
+            "timeout": 30,
+            "statusMessage": "代码质量检查..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# ~/.claude/hooks/lint-check.sh
+
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+[ -z "$FILE_PATH" ] && exit 0
+[ ! -f "$FILE_PATH" ] && exit 0
+
+LINT_OUTPUT=""
+LINT_FAILED=false
+
+# TypeScript/JavaScript
+if [[ "$FILE_PATH" =~ \.(ts|tsx|js|jsx)$ ]]; then
+  if command -v eslint &>/dev/null; then
+    LINT_OUTPUT=$(eslint --no-eslintrc --rule 'no-unused-vars: error' "$FILE_PATH" 2>&1 || true)
+    [ -n "$LINT_OUTPUT" ] && LINT_FAILED=true
+  fi
+fi
+
+# Python
+if [[ "$FILE_PATH" =~ \.py$ ]]; then
+  if command -v flake8 &>/dev/null; then
+    LINT_OUTPUT=$(flake8 --max-line-length=100 "$FILE_PATH" 2>&1 || true)
+    [ -n "$LINT_OUTPUT" ] && LINT_FAILED=true
+  fi
+fi
+
+# Shell 脚本
+if [[ "$FILE_PATH" =~ \.sh$ ]]; then
+  if command -v shellcheck &>/dev/null; then
+    LINT_OUTPUT=$(shellcheck -S warning "$FILE_PATH" 2>&1 || true)
+    [ -n "$LINT_OUTPUT" ] && LINT_FAILED=true
+  fi
+fi
+
+if [ "$LINT_FAILED" = true ] && [ -n "$LINT_OUTPUT" ]; then
+  # 将 lint 错误通知给 Claude（exit 2，Claude 会看到并尝试修复）
+  echo "$FILE_PATH 存在代码质量问题：" >&2
+  echo "$LINT_OUTPUT" >&2
+  exit 2
+fi
+
+exit 0
+```
+
+## 完整配置模板（可直接复制使用）
+
+以下是一个包含常用配置的完整 `~/.claude/settings.json` 模板：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "COMMAND=$(cat | jq -r '.tool_input.command // empty'); if echo \"$COMMAND\" | grep -qE '(rm -rf /|dd if=/dev/random|mkfs\\.)'; then echo \"危险命令被阻止\" >&2; exit 2; fi",
+            "timeout": 3,
+            "statusMessage": "安全检查..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); echo \"{\\\"ts\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\",\\\"tool\\\":\\\"$(echo $INPUT | jq -r .tool_name)\\\"}\">>/tmp/claude-audit.log",
+            "timeout": 3,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"=== 会话开始: $(date) ===\"; git status --short 2>/dev/null | head -10",
+            "timeout": 10,
+            "statusMessage": "初始化会话..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v osascript &>/dev/null && osascript -e 'display notification \"Claude 完成了任务\" with title \"Claude Code\"' || true",
+            "async": true,
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 常见错误与调试方法
+
+### 错误 1：命令未找到
+
+```
+Error: spawn /bin/bash ENOENT
+```
+
+解决方案：确保脚本文件有执行权限：
+```bash
+chmod +x ~/.claude/hooks/my-hook.sh
+```
+
+### 错误 2：jq 解析失败
+
+```
+jq: error (at <stdin>:0): null
+```
+
+解决方案：使用默认值防止 null：
+```bash
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+# 而不是：
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
+```
+
+### 错误 3：Hook 超时
+
+对于耗时较长的操作，增加 `timeout` 或使用 `async: true`：
+```json
+{
+  "type": "command",
+  "command": "./slow-operation.sh",
+  "timeout": 120,
+  "async": true
+}
+```
+
+### 调试方法：开启详细日志
+
+```bash
+# 使用 --debug-to-stderr 标志运行 Claude Code，查看 Hook 执行详情
+claude --debug-to-stderr 2>&1 | grep -i hook
+```
+
+### 调试方法：测试 Hook 脚本
+
+在配置到 Claude Code 之前，先独立测试 Hook 脚本：
+
+```bash
+# 模拟 PreToolUse 的 stdin 输入
+echo '{
+  "hook_event_name": "PreToolUse",
+  "session_id": "test-session",
+  "transcript_path": "/tmp/test.json",
+  "cwd": "/Users/user/project",
+  "tool_name": "Bash",
+  "tool_input": {"command": "git status"},
+  "tool_use_id": "test-id-001"
+}' | ~/.claude/hooks/my-hook.sh
+echo "Exit code: $?"
+```
+
+### 调试方法：使用 `/hooks` 命令
+
+在 Claude Code 交互界面中输入 `/hooks`，可以看到所有已配置的 Hook 列表，并检查它们的来源和状态。
+
+## 小结
+
+配置一个有效的 Claude Code Hook，只需要：
+
+1. **确定触发事件**（PreToolUse、PostToolUse、SessionStart 等）
+2. **设置合适的 matcher**（精确工具名、glob 模式、或省略表示全匹配）
+3. **编写 Hook 脚本**（读取 stdin → 处理逻辑 → 输出结果 → 正确的 exit code）
+4. **将配置写入 settings.json**
+
+遵循"exit 0=成功，exit 2=阻断，其他=非阻断错误"的约定，就能构建出稳定可靠的 Hook 系统。
+
+<SourceRef file="source/src/schemas/hooks.ts" lines="1-220" />
+<SourceRef file="source/src/utils/hooks/hooksConfigManager.ts" lines="26-267" />
+
+<ArticleComplete />

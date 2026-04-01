@@ -1,0 +1,222 @@
+---
+sidebar_position: 3
+title: InProcessTeammateTask：进程内协作 Swarm 模式
+description: 深入解析 InProcessTeammateTask 如何实现同进程多 AI 实例协作的 Swarm 模式
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# InProcessTeammateTask：进程内协作 Swarm 模式
+
+<DifficultyBadge level="深度" />
+
+Claude Code 的 Swarm 模式是一种独特的多 AI 协作架构：多个 AI 实例运行在**同一个 Node.js 进程内**，通过邮箱（mailbox）传递消息，共享团队状态，像真正的软件工程团队一样协作完成任务。这一切通过 `InProcessTeammateTask` 实现。
+
+## 什么是"进程内协作"？
+
+与 `LocalAgentTask`（子代理）不同，`InProcessTeammateTask`（进程内队友）的核心特征是：
+
+| 特性 | LocalAgentTask（子代理） | InProcessTeammateTask（队友） |
+|------|------------------------|------------------------------|
+| 进程隔离 | 同进程，但上下文独立 | 同进程，使用 AsyncLocalStorage 隔离 |
+| 生命周期 | 完成一个任务后结束 | 持续存在，可等待新任务（idle 状态） |
+| 通信方式 | XML task-notification | 邮箱（mailbox）消息传递 |
+| 身份 | 匿名 agentId | 具名身份（agentName@teamName） |
+| 团队意识 | 无 | 有（知道自己属于哪个团队） |
+| 计划模式 | 可选 | 可配置（planModeRequired） |
+
+进程内的意思是：Leader AI 和所有 Teammate AI 都在同一个操作系统进程里运行，共享内存（但通过 AsyncLocalStorage 隔离各自的"当前上下文"）。
+
+## Swarm 模式概述
+
+Swarm（蜂群）模式来自 Anthropic 对多 AI 协作范式的探索。在这个模式下：
+
+```
+Leader AI（主代理）
+    │
+    ├── TeamCreate 工具 → 创建团队
+    │
+    ├── AgentTool → 生成 Teammate A（researcher）
+    │                  └── 通过 InProcessTeammateTask 运行
+    │
+    ├── AgentTool → 生成 Teammate B（coder）
+    │                  └── 通过 InProcessTeammateTask 运行
+    │
+    └── SendMessage 工具 → 向队友发送任务或跟进消息
+```
+
+Leader AI 不直接执行繁重工作，而是将任务分配给队友，队友完成后通过邮箱汇报，Leader 汇总结果。
+
+## 队友身份：agentName@teamName
+
+每个进程内队友都有团队感知的身份（Team-aware identity）：
+
+```typescript
+// source/src/tasks/InProcessTeammateTask/types.ts
+export type TeammateIdentity = {
+  agentId: string          // 完整身份 ID，如 "researcher@my-team"
+  agentName: string        // 角色名，如 "researcher"
+  teamName: string         // 团队名，如 "my-team"
+  color?: string           // UI 显示颜色（用于区分不同队友）
+  planModeRequired: boolean // 是否需要进入计划模式才能执行
+  parentSessionId: string  // Leader 的会话 ID（用于上下文关联）
+}
+```
+
+这种命名约定（`name@team`）类似于电子邮件地址，表达了"谁在哪个团队工作"。在 UI 层，每个队友显示不同颜色，用户可以切换查看每个队友的实时对话记录。
+
+## AsyncLocalStorage：进程内隔离机制
+
+多个 AI 实例在同一进程里运行，如何避免"相互干扰"？答案是 Node.js 的 `AsyncLocalStorage`。
+
+AsyncLocalStorage 是 Node.js 的异步上下文存储机制，类似于线程本地变量（Thread-Local Storage）的异步版本。每个异步调用链都可以有自己的独立存储空间：
+
+```
+主进程
+├── [AsyncLocalStorage: leader_context]
+│       └── Leader AI 的查询循环
+├── [AsyncLocalStorage: researcher_context]
+│       └── Teammate A 的查询循环
+└── [AsyncLocalStorage: coder_context]
+        └── Teammate B 的查询循环
+```
+
+每个队友在创建时，`spawnInProcessTeammate` 会建立专属的 `TeammateContext`，存入 AsyncLocalStorage，之后该队友的所有操作都在这个上下文中执行，不会与其他队友混淆。
+
+## 邮箱通信机制
+
+进程内队友之间通过**邮箱（mailbox）**通信，而不是直接函数调用。这是一个异步消息传递系统：
+
+```typescript
+// 向队友发送消息（Leader 或其他队友）
+await writeToMailbox(
+  recipientAgentName,       // 接收者名称（如 "researcher"）
+  {
+    from: senderName,       // 发送者名称
+    text: messageContent,   // 消息内容（支持 JSON 结构体）
+    timestamp: new Date().toISOString(),
+    color: senderColor,     // 发送者颜色（用于 UI 显示）
+  },
+  taskListId,               // 关联的任务列表 ID
+)
+```
+
+邮箱的设计理念：
+- **解耦**：发送方不需要知道接收方当前是否在运行
+- **异步**：队友可以在完成当前工作后才处理邮件
+- **持久化**：消息写入磁盘，即使队友临时处于 idle 状态也不会丢失
+- **类型安全**：通过 JSON 结构体支持结构化消息（如任务分配通知）
+
+与 `LocalAgentTask` 的 XML task-notification 相比，邮箱更像一个真正的消息系统，而不是单向的结果汇报。
+
+## 计划模式审批流
+
+`InProcessTeammateTask` 支持 `planModeRequired`——队友在执行实质性操作前，必须先提交一个计划让 Leader 审批：
+
+```typescript
+// source/src/tasks/InProcessTeammateTask/types.ts
+export type InProcessTeammateTaskState = TaskStateBase & {
+  ...
+  // 计划模式审批追踪
+  awaitingPlanApproval: boolean  // 当前是否在等待审批
+
+  // 权限模式（队友可独立切换，不影响 Leader）
+  permissionMode: PermissionMode
+  ...
+}
+```
+
+流程：
+1. 队友完成研究阶段，生成实施计划
+2. `awaitingPlanApproval = true`，队友进入等待
+3. Leader AI（或用户）审查计划
+4. 审批通过 → `awaitingPlanApproval = false`，队友继续执行
+5. 审批拒绝 → 队友修改计划，重新提交
+
+这使得高风险操作（修改大量文件、执行部署）在 AI Swarm 中也能有人工审核节点。
+
+## idle 与 active 状态
+
+`InProcessTeammateTask` 有一个 `LocalAgentTask` 没有的特殊状态：**idle（空闲）**。
+
+```typescript
+isIdle: boolean   // 队友是否在等待新工作
+```
+
+当队友完成当前任务但团队还没解散时，队友进入 idle 状态等待新任务。Leader 可以随时通过 `SendMessage` 工具向空闲队友发送新任务，队友立即恢复 active 状态。
+
+这与 LocalAgentTask（完成即结束）的区别类似于：
+- LocalAgentTask 是**外包合同工**（项目结束合同终止）
+- InProcessTeammateTask 是**全职员工**（项目结束但仍在职，等待下一个任务）
+
+空闲队友的优势：他们已经有了大量上下文（代码结构、之前的发现），可以高效地处理相关后续任务，无需重新构建上下文。
+
+## 消息历史的内存上限
+
+InProcessTeammateTask 在 AppState 中保存对话记录，但为防止内存爆炸，有一个上限：
+
+```typescript
+// source/src/tasks/InProcessTeammateTask/types.ts
+export const TEAMMATE_MESSAGES_UI_CAP = 50
+
+export function appendCappedMessage<T>(
+  prev: readonly T[] | undefined,
+  item: T,
+): T[] {
+  if (prev === undefined || prev.length === 0) {
+    return [item]
+  }
+  if (prev.length >= TEAMMATE_MESSAGES_UI_CAP) {
+    // 超过 50 条时，丢弃最旧的，保留最新的 49 条 + 新消息
+    const next = prev.slice(-(TEAMMATE_MESSAGES_UI_CAP - 1))
+    next.push(item)
+    return next
+  }
+  return [...prev, item]
+}
+```
+
+这个设计来自真实的内存压力问题：根据代码注释中的数据分析（BQ analysis round 9, 2026-03-20），在 whale session 9a990de8 中，用户在 2 分钟内启动了 292 个代理，最终内存达到 36.8GB。上限为 50 条消息的 UI 镜像显著缓解了这个问题。
+
+完整的对话记录仍然保存在磁盘上（代理转录文件），AppState 中只保留最近 50 条用于 UI 展示。
+
+## 什么场景适合使用 Swarm？
+
+Swarm 模式适合以下场景：
+
+1. **大型并行研究**：同时让多个队友调查代码库的不同部分
+2. **流水线式工作流**：researcher → coder → reviewer 串行协作
+3. **长期持续任务**：需要多轮交互的任务（队友保持 idle 以便续接上下文）
+4. **专家分工**：不同队友有不同的技能定位（前端专家、后端专家、测试专家）
+
+相比之下，以下情况不适合 Swarm：
+- 简单的一次性任务（单个子代理更轻量）
+- 需要严格顺序执行的任务（并行优势无法发挥）
+- 任务之间高度依赖（通信开销抵消并行收益）
+
+## 生命周期管理
+
+```
+spawnInProcessTeammate()
+    │
+    ├── generateTaskId('in_process_teammate') → t_xxxxxxxx
+    ├── createTeammateContext() → AsyncLocalStorage 上下文
+    ├── 注册到 AppState.tasks
+    ├── 注册 cleanup 回调（进程退出时清理）
+    │
+    └── [Async] 队友查询循环开始
+            ├── isIdle = false（开始工作）
+            ├── 执行 AI 查询轮次
+            ├── 工具调用、结果处理
+            ├── 完成 → isIdle = true（等待新任务）
+            │          └── onIdleCallbacks 回调通知 Leader
+            └── kill() → killInProcessTeammate()
+                          └── abortController.abort()
+```
+
+<SourceRef file="source/src/tasks/InProcessTeammateTask/InProcessTeammateTask.tsx" lines="1-126" />
+<SourceRef file="source/src/tasks/InProcessTeammateTask/types.ts" lines="1-122" />
+
+<ArticleComplete />

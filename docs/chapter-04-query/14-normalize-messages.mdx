@@ -1,0 +1,260 @@
+---
+sidebar_position: 2
+title: "消息归一化：normalizeMessagesForAPI()"
+description: 深入理解 Claude Code 如何将内部消息格式转换为 Claude API 期望的标准格式
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 消息归一化：normalizeMessagesForAPI()
+
+<DifficultyBadge level="进阶" />
+
+在 Claude Code 内部，消息以一种富含元数据的格式存储——包含 UUID、时间戳、`isVirtual` 标志、`isMeta` 标志等字段，这些字段服务于 UI 渲染、历史管理、权限追踪等内部需求。但 Claude API 只接受干净的 `user` / `assistant` 两种角色消息，且有严格的内容结构要求。
+
+`normalizeMessagesForAPI()` 就是这两个世界之间的桥梁。
+
+## 为什么需要消息归一化？
+
+Claude Code 的内部消息类型体系非常丰富：
+
+```typescript
+// source/src/types/message.ts（部分）
+type Message =
+  | UserMessage          // 用户消息
+  | AssistantMessage     // 助手消息
+  | SystemMessage        // 系统信息（通知、警告等）
+  | AttachmentMessage    // 附件（内存、技能、文件变更等）
+  | ProgressMessage      // 进度更新
+  | TombstoneMessage     // 废弃标记
+  | ToolUseSummaryMessage // 工具使用摘要
+  // ...
+```
+
+而 Claude API 只接受：
+
+```json
+[
+  { "role": "user",      "content": [...] },
+  { "role": "assistant", "content": [...] },
+  { "role": "user",      "content": [...] }
+]
+```
+
+消息角色必须严格交替，不能有两个连续的 `user` 消息或 `assistant` 消息（至少在 Bedrock 等部分 API 兼容层上如此）。此外，`SystemMessage`、`AttachmentMessage`、`ProgressMessage` 等类型根本不是有效的 API 消息类型，需要被过滤或转换。
+
+## 函数签名
+
+```typescript
+// source/src/utils/messages.ts，第 1989 行
+export function normalizeMessagesForAPI(
+  messages: Message[],    // 内部消息列表
+  tools: Tools = [],      // 当前可用工具列表（用于过滤引用）
+): (UserMessage | AssistantMessage)[]
+```
+
+## 核心处理流程
+
+### 第一步：重排附件消息
+
+```typescript
+// source/src/utils/messages.ts，第 1999 行
+const reorderedMessages = reorderAttachmentsForAPI(messages).filter(
+  // 过滤掉 isVirtual 标记的消息（仅用于 UI 展示）
+  m => !((m.type === 'user' || m.type === 'assistant') && m.isVirtual),
+)
+```
+
+`AttachmentMessage` 是 Claude Code 特有的类型，用来携带内存文件、技能发现结果、任务通知等附加上下文。`reorderAttachmentsForAPI()` 会将这些附件"上浮"，直到它们遇到一个 `tool_result` 或 `assistant` 消息为止，确保附件始终位于合法的对话位置。
+
+同时，`isVirtual` 的消息（比如 REPL 内部工具调用的展示消息）会被完全过滤掉，它们只存在于 UI 层，不应进入 API。
+
+### 第二步：构建错误溯源映射
+
+```typescript
+// source/src/utils/messages.ts，第 2004 行
+const errorToBlockTypes: Record<string, Set<string>> = {
+  [getPdfTooLargeErrorMessage()]:         new Set(['document']),
+  [getPdfPasswordProtectedErrorMessage()]: new Set(['document']),
+  [getPdfInvalidErrorMessage()]:          new Set(['document']),
+  [getImageTooLargeErrorMessage()]:       new Set(['image']),
+  [getRequestTooLargeErrorMessage()]:     new Set(['document', 'image']),
+}
+```
+
+当 API 因为 PDF 过大或图片过大等原因报错时，Claude Code 会在消息历史中留下一条合成的 API 错误消息。在下次发送消息时，需要把导致错误的那个 `document` 或 `image` block 从对应的用户消息中剔除，否则每次都会触发同样的错误。
+
+这段代码向后查找最近的 `isMeta` 用户消息，记录下需要从其中剔除的 block 类型，存入 `stripTargets` 映射。
+
+### 第三步：逐条处理消息
+
+消息列表按类型分别处理：
+
+#### 处理 SystemMessage（本地命令输出）
+
+```typescript
+// source/src/utils/messages.ts，第 2078 行
+case 'system': {
+  // 只有 local_command 类型的 system 消息需要进入 API
+  // 其他系统消息（通知、警告等）直接被过滤掉
+  const userMsg = createUserMessage({
+    content: message.content,
+    uuid: message.uuid,
+    timestamp: message.timestamp,
+  })
+  const lastMessage = last(result)
+  if (lastMessage?.type === 'user') {
+    // 合并到前一条用户消息中，避免连续 user 消息
+    result[result.length - 1] = mergeUserMessages(lastMessage, userMsg)
+    return
+  }
+  result.push(userMsg)
+  return
+}
+```
+
+`/run` 命令执行 bash 的输出是 `SystemLocalCommandMessage` 类型，需要作为用户消息发送给 Claude，让它能看到命令执行结果。
+
+#### 处理 UserMessage
+
+```typescript
+// source/src/utils/messages.ts，第 2094 行
+case 'user': {
+  // 剔除不可用工具的 tool_reference block
+  let normalizedMessage = message
+  if (!isToolSearchEnabledOptimistic()) {
+    normalizedMessage = stripToolReferenceBlocksFromUserMessage(message)
+  } else {
+    normalizedMessage = stripUnavailableToolReferencesFromUserMessage(
+      message,
+      availableToolNames,
+    )
+  }
+
+  // 剔除导致 PDF/图片错误的内容 block
+  const typesToStrip = stripTargets.get(normalizedMessage.uuid)
+  if (typesToStrip && normalizedMessage.isMeta) {
+    // 过滤掉对应类型的 block
+    const filtered = content.filter(
+      block => !typesToStrip.has(block.type),
+    )
+    // ...
+  }
+
+  // 如果前一条也是 user 消息，合并（Bedrock 兼容）
+  const lastMessage = last(result)
+  if (lastMessage?.type === 'user') {
+    result[result.length - 1] = mergeUserMessages(lastMessage, normalizedMessage)
+    return
+  }
+  result.push(normalizedMessage)
+  return
+}
+```
+
+**关键操作：合并连续 user 消息**。这是 Bedrock 兼容性的必要处理，因为 Bedrock 不支持连续的同角色消息，而 1P API 虽然会自动合并，但客户端主动合并可以减少不必要的 API 错误。
+
+#### 处理 AssistantMessage
+
+```typescript
+// source/src/utils/messages.ts，第 2201 行
+case 'assistant': {
+  const normalizedMessage: AssistantMessage = {
+    ...message,
+    message: {
+      ...message.message,
+      content: message.message.content.map(block => {
+        if (block.type === 'tool_use') {
+          const tool = tools.find(t => toolMatchesName(t, block.name))
+          const normalizedInput = tool
+            ? normalizeToolInputForAPI(tool, block.input as Record<string, unknown>)
+            : block.input
+          const canonicalName = tool?.name ?? block.name
+          // ...
+        }
+        return block
+      }),
+    },
+  }
+  // ...
+}
+```
+
+对 `assistant` 消息的处理主要是对 `tool_use` block 里的 `input` 进行归一化——某些工具（如 `ExitPlanModeV2`）在内部存储了额外字段（如 `plan`），这些字段不应该发送给 API。`normalizeToolInputForAPI()` 负责清理这些内部字段。
+
+#### 处理 AttachmentMessage
+
+附件消息（`AttachmentMessage`）会被转换为用户消息，其 `attachment` 字段被序列化为文本内容插入对话历史。这让 Claude 可以读取到附件携带的信息（比如内存文件内容、任务通知等）。
+
+## 一个完整的转换示例
+
+假设内部消息历史是这样的：
+
+```
+[
+  UserMessage { content: "帮我读取 README.md", isMeta: false },
+  AssistantMessage {
+    content: [
+      { type: "text", text: "好的，我来读取文件。" },
+      { type: "tool_use", id: "tu_01", name: "Read", input: { file_path: "README.md" } }
+    ]
+  },
+  UserMessage {
+    content: [
+      { type: "tool_result", tool_use_id: "tu_01", content: "# README\n..." }
+    ],
+    isMeta: true    // 工具结果是 meta 消息
+  },
+  SystemMessage { type: "local_command", content: "$ ls\nREADME.md" },
+  AttachmentMessage { attachment: { type: "memory", content: "记忆内容..." } }
+]
+```
+
+经过 `normalizeMessagesForAPI()` 后变为：
+
+```
+[
+  { role: "user",      content: [{ type: "text", text: "帮我读取 README.md" }] },
+  { role: "assistant", content: [
+      { type: "text", text: "好的，我来读取文件。" },
+      { type: "tool_use", id: "tu_01", name: "Read", input: { file_path: "README.md" } }
+  ]},
+  { role: "user", content: [
+      // tool_result 和 system 消息合并为一条 user 消息
+      { type: "tool_result", tool_use_id: "tu_01", content: "# README\n..." },
+      { type: "text", text: "$ ls\nREADME.md" },
+      { type: "text", text: "[内存附件内容...]" }
+  ]}
+]
+```
+
+## 消息类型过滤规则总结
+
+| 内部消息类型 | 处理方式 |
+|------------|---------|
+| `UserMessage` | 保留，合并连续项，剔除无效 block |
+| `AssistantMessage` | 保留，归一化 tool_use input |
+| `SystemMessage (local_command)` | 转换为 UserMessage |
+| `SystemMessage (其他)` | 完全过滤，不发送 API |
+| `AttachmentMessage` | 转换为 UserMessage 的内容 |
+| `ProgressMessage` | 完全过滤 |
+| `TombstoneMessage` | 完全过滤 |
+| `isVirtual = true` 的消息 | 完全过滤 |
+
+## 为什么不在存储时就规范化？
+
+你可能会问：为什么不直接用 API 格式存储消息？
+
+因为 Claude Code 的消息历史肩负多重职责：
+1. **UI 渲染**：需要区分工具进度、系统通知等类型
+2. **历史管理**：需要 UUID 追踪、时间戳排序
+3. **权限追踪**：需要 `isMeta` 区分用户输入和系统生成
+4. **压缩决策**：需要元数据判断哪些消息可以被压缩
+
+把这些关注点统一到 API 格式里会导致格式臃肿且难以维护。`normalizeMessagesForAPI()` 作为一个纯转换函数，每次调用时按需转换，保持了内部格式和 API 格式的清晰分离。
+
+<SourceRef file="source/src/utils/messages.ts" lines="1989-2260" />
+
+<ArticleComplete />

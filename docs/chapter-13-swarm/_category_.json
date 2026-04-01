@@ -1,0 +1,8 @@
+{
+  "label": "第十三章：Agent Teams / Swarm 协作",
+  "position": 13,
+  "link": {
+    "type": "generated-index",
+    "description": "深入解析 Claude Code 的多 Agent 协作机制，从 Swarm 架构到进程间通信的完整实现"
+  }
+}

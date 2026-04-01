@@ -1,0 +1,364 @@
+---
+sidebar_position: 3
+title: "Hook 注册与发现机制深度解读"
+description: 深入解析 Hook 的 5 大配置来源、发现算法、工具名称 glob 匹配、去重与优先级排序
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Hook 注册与发现机制深度解读
+
+<DifficultyBadge level="深度" />
+
+## Hook 的 5 大配置来源
+
+Claude Code 的 Hook 可以来自 5 个不同的来源，每个来源对应不同的作用范围和优先级。理解这一点对于多人协作场景下的 Hook 配置管理至关重要。
+
+```typescript
+// source/src/utils/hooks/hooksSettings.ts
+export type HookSource =
+  | EditableSettingSource  // 'userSettings' | 'projectSettings' | 'localSettings'
+  | 'policySettings'       // 企业策略（只读）
+  | 'pluginHook'           // 插件提供的 Hook
+  | 'sessionHook'          // 会话级运行时 Hook
+  | 'builtinHook'          // Claude Code 内置 Hook
+```
+
+### 1. 用户全局设置（userSettings）
+
+位置：`~/.claude/settings.json`
+
+这是最常用的配置位置，适合个人工作流的全局定制。所有项目都会生效：
+
+```json
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "echo $HOOK_INPUT | jq '.tool_input.command' >> ~/bash_history.log" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+显示字符串：`User settings (~/.claude/settings.json)`
+
+### 2. 项目级设置（projectSettings）
+
+位置：`.claude/settings.json`（当前工作目录的 `.claude/` 子目录）
+
+适合团队共享的 Hook 配置，随代码库一起提交到版本控制：
+
+```json
+// .claude/settings.json（随 git 提交）
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          { "type": "command", "command": "npx prettier --write \"$HOOK_FILE_PATH\"" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+显示字符串：`Project settings (.claude/settings.json)`
+
+### 3. 本地覆盖设置（localSettings）
+
+位置：`.claude/settings.local.json`
+
+通常加入 `.gitignore`，用于个人在特定项目中的临时覆盖，不影响其他团队成员：
+
+```json
+// .claude/settings.local.json（加入 .gitignore）
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "./my-personal-pre-hook.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+显示字符串：`Local settings (.claude/settings.local.json)`
+
+### 4. 企业策略设置（policySettings）
+
+这是企业/组织级别的强制配置，由管理员部署，用户无法覆盖。当 `policySettings` 中设置了 `allowManagedHooksOnly: true` 时，所有用户/项目/本地的 Hook 配置都会被禁用：
+
+```typescript
+// source/src/utils/hooks/hooksSettings.ts（部分）
+export function getAllHooks(appState: AppState): IndividualHookConfig[] {
+  // 检查是否被限制为仅使用托管 Hook
+  const policySettings = getSettingsForSource('policySettings')
+  const restrictedToManagedOnly = policySettings?.allowManagedHooksOnly === true
+
+  // 如果启用了 allowManagedHooksOnly，不显示任何用户/项目/本地 Hook
+  if (!restrictedToManagedOnly) {
+    // 从可编辑来源获取 Hook...
+  }
+}
+```
+
+### 5. 插件 Hook（pluginHook）
+
+Claude Code 插件系统允许插件在其 `hooks/hooks.json` 文件中定义 Hook：
+
+```
+~/.claude/plugins/repos/source/<plugin-name>/hooks/hooks.json
+```
+
+插件 Hook 使用 `${CLAUDE_PLUGIN_ROOT}` 和 `${CLAUDE_PLUGIN_DATA}` 变量引用插件自身的文件：
+
+```json
+// 插件的 hooks/hooks.json
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/scripts/pre-bash.sh" }
+      ]
+    }
+  ]
+}
+```
+
+显示字符串：`Plugin hooks (~/.claude/plugins/*/hooks/hooks.json)`
+
+### 6. 会话级 Hook（sessionHook）
+
+这类 Hook 在运行时通过代码动态注册，仅对当前会话有效，不持久化到任何文件：
+
+```typescript
+// 通过 addSessionHook() 注册
+addSessionHook(
+  setAppState,
+  sessionId,
+  'PreToolUse',     // 事件类型
+  'Bash',           // matcher
+  { type: 'command', command: './session-check.sh' },
+  undefined,         // onHookSuccess 回调
+)
+```
+
+显示字符串：`Session hooks (in-memory, temporary)`
+
+## Hook 发现算法
+
+当 Claude Code 需要执行某个 Hook 事件时，调用 `getAllHooks(appState)` 来收集所有配置的 Hook。这个函数实现了一个**去重的、按来源优先级排序的**发现算法：
+
+```typescript
+export function getAllHooks(appState: AppState): IndividualHookConfig[] {
+  const hooks: IndividualHookConfig[] = []
+
+  // Step 1: 检查企业策略限制
+  const policySettings = getSettingsForSource('policySettings')
+  const restrictedToManagedOnly = policySettings?.allowManagedHooksOnly === true
+
+  if (!restrictedToManagedOnly) {
+    const sources = ['userSettings', 'projectSettings', 'localSettings']
+    const seenFiles = new Set<string>()  // 去重：避免同一文件被处理两次
+
+    for (const source of sources) {
+      const filePath = getSettingsFilePathForSource(source)
+      if (filePath) {
+        const resolvedPath = resolve(filePath)
+        if (seenFiles.has(resolvedPath)) {
+          continue  // 去重：跳过已处理的文件（如 home 目录下 userSettings=projectSettings 的情况）
+        }
+        seenFiles.add(resolvedPath)
+      }
+
+      const sourceSettings = getSettingsForSource(source)
+      if (!sourceSettings?.hooks) continue
+
+      // 遍历所有事件的所有 Matcher 的所有 Hook
+      for (const [event, matchers] of Object.entries(sourceSettings.hooks)) {
+        for (const matcher of matchers) {
+          for (const hookCommand of matcher.hooks) {
+            hooks.push({ event, config: hookCommand, matcher: matcher.matcher, source })
+          }
+        }
+      }
+    }
+  }
+
+  // Step 2: 追加会话级 Hook
+  const sessionId = getSessionId()
+  const sessionHooks = getSessionHooks(appState, sessionId)
+  // ... 遍历并追加
+
+  return hooks
+}
+```
+
+**关键去重逻辑：** `seenFiles` Set 解决了一个常见问题——当 Claude Code 从 home 目录运行时，`userSettings`（`~/.claude/settings.json`）和 `projectSettings`（`./.claude/settings.json`）指向同一个文件，如果不去重，同一 Hook 会被执行两次。
+
+## getMatchingHooks：精准匹配算法
+
+在知道所有 Hook 之后，系统还需要根据当前事件的 `matchQuery`（如工具名称）筛选出实际应该执行的 Hook。这由 `getMatchingHooks()` 实现：
+
+```typescript
+// source/src/utils/hooks.ts 第 1603 行
+export async function getMatchingHooks(
+  appState: AppState | null,
+  hookEvent: HookEvent,
+  matchQuery: string,  // e.g., 工具名 "Bash"，或触发源 "startup"
+  sessionId: string,
+  toolUseContext?: ToolUseContext,
+): Promise<{...}[]> {
+```
+
+匹配逻辑包含三层过滤：
+
+### 第一层：事件类型过滤
+
+只有 `event` 字段与 `hookEvent` 参数一致的 Hook 才会通过第一层过滤：
+
+```typescript
+// 只取 PreToolUse 事件的 Hook
+const eventHooks = allHooks.filter(h => h.event === hookEvent)
+```
+
+### 第二层：matcher 字符串过滤
+
+`matcher` 字段支持两种匹配方式：
+
+1. **精确匹配**：`matcher === matchQuery`（如 `"Bash" === "Bash"`）
+2. **glob 匹配**：使用 `micromatch` 库进行 glob 模式匹配（如 `"Bash*"` 匹配 `"BashTool"`）
+3. **空 matcher**：`matcher` 为 undefined/空字符串时，匹配所有查询（通配）
+
+```typescript
+function matchesQuery(matcher: string | undefined, query: string): boolean {
+  if (!matcher) return true  // 空 matcher = 匹配所有
+  if (matcher === query) return true  // 精确匹配
+  return micromatch.isMatch(query, matcher)  // glob 匹配
+}
+```
+
+### 第三层：`if` 条件过滤
+
+如果 `HookCommand` 有 `if` 字段，则进一步用权限规则语法检查：
+
+```typescript
+// "if": "Bash(git *)" 表示仅当 Bash 工具执行 git 命令时才运行此 Hook
+if (hook.if) {
+  const rule = permissionRuleValueFromString(hook.if)
+  if (!matchesPermissionRule(rule, toolName, toolInput)) {
+    continue  // 跳过不匹配的 Hook
+  }
+}
+```
+
+这一层过滤在子进程 spawn 之前执行，是重要的性能优化。
+
+## sortMatchersByPriority：优先级排序
+
+当多个 Matcher 都匹配同一个事件时，系统通过 `sortMatchersByPriority()` 决定执行顺序：
+
+```typescript
+export function sortMatchersByPriority(
+  matchers: HookMatcher[],
+): HookMatcher[] {
+  // 精确匹配（有 matcher 的）排在通配符（无 matcher 的）之前
+  return matchers.slice().sort((a, b) => {
+    const aHasMatcher = !!a.matcher
+    const bHasMatcher = !!b.matcher
+    if (aHasMatcher && !bHasMatcher) return -1  // a 更具体，排前面
+    if (!aHasMatcher && bHasMatcher) return 1   // b 更具体，排前面
+    return 0  // 相同优先级，保持原始顺序
+  })
+}
+```
+
+这意味着：针对特定工具的 Hook（如 `matcher: "Bash"`）会在通配符 Hook（`matcher` 为空）之前执行。
+
+## 配置来源的实际加载顺序
+
+综合以上内容，Hook 的实际加载和执行顺序为：
+
+```
+1. userSettings Hooks
+   ↓（如果未受企业策略限制）
+2. projectSettings Hooks
+   ↓（如果文件路径不重复）
+3. localSettings Hooks
+   ↓
+4. pluginHook Hooks（来自所有已安装插件）
+   ↓
+5. sessionHook Hooks（运行时动态注册）
+
+在每个来源内部，按 Matcher 优先级排序：
+- 有 matcher 的规则先执行
+- 无 matcher（通配）的规则后执行
+```
+
+## 工作区信任检查
+
+一个经常被忽视的重要机制：**所有 Hook 都需要工作区信任（Workspace Trust）**。
+
+```typescript
+// source/src/utils/hooks.ts
+export function shouldSkipHookDueToTrust(): boolean {
+  const isInteractive = !getIsNonInteractiveSession()
+  if (!isInteractive) {
+    return false  // SDK 模式下，信任是隐式的
+  }
+
+  const hasTrust = checkHasTrustDialogAccepted()
+  return !hasTrust  // 交互模式下，必须已接受信任对话框
+}
+```
+
+这是一个深度防御（defense-in-depth）安全机制。虽然正常的程序流程会在信任对话框通过后才触发 Hook，但历史上曾出现过 `SessionEnd` Hook 在用户拒绝信任时意外执行的漏洞。这个函数彻底堵住了这类安全漏洞。
+
+## HookSource 的显示与管理
+
+当用户在 UI 中查看或管理 Hook 时，每个来源都有对应的显示字符串：
+
+```typescript
+export function hookSourceDescriptionDisplayString(source: HookSource): string {
+  switch (source) {
+    case 'userSettings': return 'User settings (~/.claude/settings.json)'
+    case 'projectSettings': return 'Project settings (.claude/settings.json)'
+    case 'localSettings': return 'Local settings (.claude/settings.local.json)'
+    case 'pluginHook': return 'Plugin hooks (~/.claude/plugins/*/hooks/hooks.json)'
+    case 'sessionHook': return 'Session hooks (in-memory, temporary)'
+    case 'builtinHook': return 'Built-in hooks (registered internally by Claude Code)'
+  }
+}
+```
+
+Claude Code 的 `/hooks` 命令（通过 `HooksConfigMenu` 组件）可以可视化展示所有已配置的 Hook 及其来源。
+
+## 小结
+
+Claude Code 的 Hook 发现机制设计得相当精巧：
+
+- **5 大来源**提供了从个人到企业的完整配置层次
+- **文件路径去重**防止了同一 Hook 被执行多次
+- **三层过滤**（事件类型 → matcher glob → if 条件）保证了精确触发
+- **优先级排序**让具体规则优先于通配规则执行
+- **工作区信任检查**作为安全底线，防止未授权执行
+
+<SourceRef file="source/src/utils/hooks/hooksSettings.ts" lines="1-228" />
+<SourceRef file="source/src/utils/hooks.ts" lines="1603-1650" />
+
+<ArticleComplete />

@@ -1,0 +1,440 @@
+---
+sidebar_position: 10
+title: "Hook 与权限系统的联动：hooks/toolPermission/ 解析"
+description: 深入解析 Hook 如何参与权限决策，PermissionContext 的设计，以及用 Hook 实现自定义权限规则
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Hook 与权限系统的联动：hooks/toolPermission/ 解析
+
+<DifficultyBadge level="深度" />
+
+## 权限系统与 Hook 系统的交汇点
+
+Claude Code 的权限系统和 Hook 系统在工具调用时紧密协作。理解它们的交互，需要先看完整的权限决策链：
+
+```
+Claude 请求调用工具
+  ↓
+[1] deny 规则检查 → 直接拒绝
+  ↓
+[2] allow 规则检查 → 直接允许
+  ↓
+[3] PermissionRequest Hook → Hook 决定 allow/deny
+  ↓
+[4] 自动分类器（auto 模式）
+  ↓
+[5] UI 用户交互（弹出权限对话框）
+  ↓（用户允许后）
+[6] PreToolUse Hook → 最后拦截/修改点
+  ↓
+工具实际执行
+```
+
+Hook 参与权限决策主要有**两个层次**：
+- **PermissionRequest Hook**（步骤 3）：直接回答"允许还是拒绝？"
+- **PreToolUse Hook**（步骤 6）：在权限通过后的最终拦截
+
+## PermissionContext：权限上下文对象
+
+`source/src/hooks/toolPermission/PermissionContext.ts` 定义了权限决策的核心上下文对象，这是权限系统和 Hook 系统之间的桥梁：
+
+```typescript
+// 权限上下文对象的核心方法
+const ctx = {
+  tool,             // 被调用的工具
+  input,            // 工具的输入参数
+  toolUseContext,   // 工具使用上下文（包含 sessionId 等）
+  toolUseID,        // 工具调用的唯一 ID
+
+  // 执行 PermissionRequest Hook
+  async runHooks(
+    permissionMode: string | undefined,
+    suggestions: PermissionUpdate[] | undefined,
+    updatedInput?: Record<string, unknown>,
+    permissionPromptStartTimeMs?: number,
+  ): Promise<PermissionDecision | null> {
+    for await (const hookResult of executePermissionRequestHooks(
+      tool.name,
+      toolUseID,
+      input,
+      toolUseContext,
+      permissionMode,
+      suggestions,
+      toolUseContext.abortController.signal,
+    )) {
+      if (hookResult.permissionRequestResult) {
+        const decision = hookResult.permissionRequestResult
+        if (decision.behavior === 'allow') {
+          return await this.handleHookAllow(...)
+        } else if (decision.behavior === 'deny') {
+          return this.buildDeny(
+            decision.message || 'Permission denied by hook',
+            { type: 'hook', hookName: 'PermissionRequest', reason: decision.message },
+          )
+        }
+      }
+    }
+    return null  // Hook 未作决策，继续到下一环节
+  },
+
+  // 构建"允许"决策
+  buildAllow(updatedInput, opts?): PermissionAllowDecision {
+    return {
+      behavior: 'allow',
+      updatedInput,
+      userModified: opts?.userModified ?? false,
+      decisionReason: opts?.decisionReason,
+    }
+  },
+
+  // 构建"拒绝"决策
+  buildDeny(message, decisionReason): PermissionDenyDecision {
+    return { behavior: 'deny', message, decisionReason }
+  },
+
+  // 持久化权限更新（写入 settings.json）
+  async persistPermissions(updates: PermissionUpdate[]): Promise<boolean> {
+    persistPermissionUpdates(updates)
+    // 更新内存中的权限上下文
+    setToolPermissionContext(
+      applyPermissionUpdates(appState.toolPermissionContext, updates),
+    )
+    return updates.some(update => supportsPersistence(update.destination))
+  },
+}
+```
+
+`runHooks()` 方法遍历所有 `PermissionRequest` Hook 的结果，一旦某个 Hook 返回了决策（allow 或 deny），立即采纳并**跳过**后续的 Hook 和 UI 交互。这体现了 Hook 在权限链中的"优先级"——Hook 的决策比 UI 用户交互更早。
+
+## executePermissionRequestHooks：权限 Hook 的执行函数
+
+```typescript
+// source/src/utils/hooks.ts 第 4157 行
+export async function* executePermissionRequestHooks<ToolInput>(
+  toolName: string,
+  toolUseID: string,
+  toolInput: ToolInput,
+  toolUseContext: ToolUseContext,
+  permissionMode: string | undefined,
+  suggestions: PermissionUpdate[] | undefined,
+  signal?: AbortSignal,
+): AsyncGenerator<AggregatedHookResult>
+```
+
+输入数据结构：
+
+```typescript
+type PermissionRequestHookInput = {
+  hook_event_name: 'PermissionRequest'
+  session_id: string
+  transcript_path: string
+  cwd: string
+  tool_name: string
+  tool_input: ToolInput
+  tool_use_id: string
+}
+```
+
+## PermissionRequest Hook 的输出格式
+
+PermissionRequest Hook 必须通过 JSON 输出表达权限决策：
+
+### 允许执行
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "allow",
+      "updatedInput": {
+        "command": "git status --short"
+      },
+      "updatedPermissions": [
+        {
+          "destination": "projectSettings",
+          "rule": "allow",
+          "value": "Bash(git status*)"
+        }
+      ]
+    }
+  }
+}
+```
+
+`updatedPermissions` 字段允许 Hook 在做出允许决策的同时，向 settings.json 写入新的权限规则，实现"允许并记住"的效果。
+
+### 拒绝执行
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "deny",
+      "message": "此命令需要系统管理员审批",
+      "interrupt": true
+    }
+  }
+}
+```
+
+`interrupt: true` 表示同时中止当前 Claude 的工作（等同于用户按了 Escape），而不仅仅是拒绝这一次工具调用。
+
+## PreToolUse Hook 的权限决策输出
+
+PreToolUse Hook 也可以参与权限决策（这是它的第二个能力，除了阻断执行外）：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "permissionDecisionReason": "此操作已通过自动安全扫描"
+  }
+}
+```
+
+或：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "文件路径包含敏感目录"
+  }
+}
+```
+
+三个可能的 `permissionDecision` 值：
+
+| 值 | 含义 |
+|----|------|
+| `allow` | 直接允许，跳过权限对话框 |
+| `deny` | 直接拒绝，告知 Claude |
+| `ask` | 强制弹出权限对话框（即使有 allow 规则） |
+
+## PermissionDenied Hook：权限被拒绝后的处理
+
+当自动分类器（auto 模式）拒绝了某个工具调用时，`PermissionDenied` 事件会触发：
+
+```typescript
+type PermissionDeniedHookInput = {
+  hook_event_name: 'PermissionDenied'
+  tool_name: string
+  tool_input: ToolInput
+  tool_use_id: string
+  reason: string  // 拒绝原因
+}
+```
+
+PermissionDenied Hook 的特殊输出：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionDenied",
+    "retry": true
+  }
+}
+```
+
+`retry: true` 告诉 Claude：虽然这次被拒绝了，但可以重试（比如，用不同的方式尝试同一操作）。
+
+## 实战：用 Hook 实现自定义权限规则
+
+### 场景 1：基于时间的权限控制（工作时间限制）
+
+```bash
+#!/bin/bash
+# 只在工作时间允许访问生产环境数据库
+
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# 检查是否是生产环境操作
+if ! echo "$COMMAND" | grep -qi "prod\|production"; then
+  exit 0  # 非生产环境，不干预
+fi
+
+HOUR=$(date +%-H)  # 0-23
+DAY=$(date +%u)    # 1=Monday ... 7=Sunday
+
+# 只允许工作日 9-18 点操作生产环境
+if [ "$DAY" -le 5 ] && [ "$HOUR" -ge 9 ] && [ "$HOUR" -lt 18 ]; then
+  exit 0  # 工作时间，允许
+fi
+
+echo "安全策略：生产环境操作只允许在工作时间（周一至周五 9:00-18:00）执行" >&2
+echo "当前时间: $(date '+%Y-%m-%d %H:%M %A')" >&2
+exit 2
+```
+
+### 场景 2：基于用户身份的权限控制
+
+```bash
+#!/bin/bash
+# 根据当前用户角色决定权限
+
+INPUT=$(cat)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+
+# 读取用户角色配置
+ROLE_FILE="$HOME/.claude/user-role"
+ROLE=$(cat "$ROLE_FILE" 2>/dev/null || echo "developer")
+
+# 限制访问 secrets 目录
+if [[ "$FILE_PATH" =~ /secrets/|/credentials/ ]]; then
+  if [ "$ROLE" != "admin" ]; then
+    # 向 Claude 发送拒绝决策（通过 JSON 输出）
+    cat <<'EOF'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "当前用户角色 (developer) 无权访问 secrets 目录，需要 admin 权限"
+  }
+}
+EOF
+    exit 0  # 注意：使用 JSON 输出时用 exit 0
+  fi
+fi
+```
+
+### 场景 3：PermissionRequest Hook 自动审批已知安全操作
+
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/auto-approve-safe.sh",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# ~/.claude/hooks/auto-approve-safe.sh
+# 自动审批已知安全的命令，避免频繁弹出权限对话框
+
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# 只读操作：直接自动允许
+SAFE_PATTERNS=(
+  "^git (status|log|diff|show|branch|tag)"
+  "^cat "
+  "^ls "
+  "^echo "
+  "^pwd"
+  "^which "
+  "^type "
+  "^node --version"
+  "^npm --version"
+)
+
+for pattern in "${SAFE_PATTERNS[@]}"; do
+  if echo "$COMMAND" | grep -qE "$pattern"; then
+    cat <<'EOF'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "allow"
+    }
+  }
+}
+EOF
+    exit 0
+  fi
+done
+
+# 其他命令：不作决策，让权限系统继续处理（弹出对话框）
+exit 0
+```
+
+## 权限 Hook 与 deny/allow 规则的协作关系
+
+Claude Code 的权限系统有三层规则：
+
+```
+settings.json 的 permissions.deny  →  拒绝（最高优先级）
+settings.json 的 permissions.allow →  允许
+PermissionRequest Hook              →  动态决策
+UI 用户交互                         →  人工决策
+```
+
+**重要区别：**
+
+- `permissions.deny` / `permissions.allow` 是**静态规则**（基于路径 glob 模式）
+- `PermissionRequest Hook` 是**动态规则**（可以读取系统状态、调用外部服务）
+
+当静态规则无法覆盖的场景（如基于时间、用户角色、外部系统状态的权限控制），Hook 是唯一的解决方案。
+
+## PermissionUpdate：权限规则持久化
+
+Hook 做出允许决策时，可以同时写入新的权限规则：
+
+```typescript
+type PermissionUpdate = {
+  destination: 'userSettings' | 'projectSettings' | 'localSettings'
+  rule: 'allow' | 'deny' | 'ask'
+  value: string  // 权限规则字符串（如 "Bash(git *)"）
+}
+```
+
+例如，当 Hook 自动批准了某个命令，同时可以将该命令添加到 `allow` 规则中，避免下次还需要批准：
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "allow",
+      "updatedPermissions": [
+        {
+          "destination": "localSettings",
+          "rule": "allow",
+          "value": "Bash(git status)"
+        }
+      ]
+    }
+  }
+}
+```
+
+这个机制实现了"学习型权限系统"——随着使用，系统逐渐了解用户的安全偏好，减少重复的权限询问。
+
+## 小结
+
+Hook 与权限系统的联动构成了 Claude Code 最强大的扩展能力之一：
+
+- **PermissionRequest Hook**：在权限对话框弹出前截获，可以自动 allow/deny
+- **PreToolUse Hook（permissionDecision）**：在权限通过后的最后一道门
+- **PermissionDenied Hook**：拒绝后的处理，支持 retry 信号
+- **PermissionContext**：封装了权限决策的完整生命周期
+- **PermissionUpdate**：允许 Hook 持久化权限规则，实现"学习型"授权
+
+正确利用这些机制，可以实现从简单的"关键词黑名单"到复杂的"基于身份和时间的 RBAC 系统"，不需要修改 Claude Code 的任何源码。
+
+<SourceRef file="source/src/hooks/toolPermission/PermissionContext.ts" lines="1-389" />
+<SourceRef file="source/src/utils/hooks.ts" lines="4157-4213" />
+
+<ArticleComplete />

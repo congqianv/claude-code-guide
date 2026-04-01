@@ -1,0 +1,211 @@
+---
+sidebar_position: 1
+title: "Tool 接口设计：Tool.ts 的 793 行在讲什么"
+description: 深度解析 Tool<Input, Output, P> 泛型接口的设计哲学，理解每个方法背后的工程思考
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Tool 接口设计：Tool.ts 的 793 行在讲什么
+
+<DifficultyBadge level="进阶" />
+
+`Tool.ts` 是整个工具系统的"宪法"。每一个工具——无论是内置的 `BashTool`、`FileEditTool`，还是通过 MCP 动态注册的第三方工具——都必须遵守这份接口契约。理解这 793 行代码，就是理解 Claude Code 工具系统的全部设计意图。
+
+## 核心泛型：Tool\<Input, Output, P\>
+
+工具接口被设计成三参数泛型类型：
+
+```typescript
+// source/src/Tool.ts，第 362 行
+export type Tool<
+  Input extends AnyObject = AnyObject,  // 输入 schema（Zod 类型）
+  Output = unknown,                      // 输出数据类型
+  P extends ToolProgressData = ToolProgressData,  // 进度数据类型
+> = {
+  // ... 所有方法
+}
+```
+
+这三个类型参数不是随意设计的：
+
+**Input** 使用 Zod schema 而非普通 TypeScript 类型。这让 `validateInput` 可以在运行时自动验证 Claude 传来的参数，并生成 JSON Schema 格式给 Claude API——一份 schema，两个用途。
+
+**Output** 是工具执行结果的类型，贯穿 `call()` 返回值、`renderToolResultMessage()` 渲染参数，以及 `mapToolResultToToolResultBlockParam()` 序列化。
+
+**P（Progress）** 是工具运行期间推送进度事件的数据类型，比如 `BashProgress`（包含实时输出）、`MCPProgress`（MCP 调用进度）。
+
+## 核心方法逐一解读
+
+### call()：真正执行的地方
+
+```typescript
+call(
+  args: z.infer<Input>,           // 已验证的输入参数
+  context: ToolUseContext,        // 包含 AbortController、AppState 等
+  canUseTool: CanUseToolFn,       // 运行时权限检查回调
+  parentMessage: AssistantMessage,// 触发此工具调用的 assistant 消息
+  onProgress?: ToolCallProgress<P>, // 可选进度回调
+): Promise<ToolResult<Output>>
+```
+
+`call()` 是工具的执行心脏。`context` 参数尤其重要，它携带了整个会话状态：
+
+```typescript
+// ToolUseContext 包含的关键字段（Tool.ts 第 158-300 行节选）
+export type ToolUseContext = {
+  options: {
+    tools: Tools          // 当前工具池（用于子工具调用）
+    mainLoopModel: string // 当前使用的模型名称
+    mcpClients: MCPServerConnection[]
+  }
+  abortController: AbortController  // 用于响应 Ctrl+C 中断
+  readFileState: FileStateCache      // 文件读取缓存（防止重复读取）
+  getAppState(): AppState            // 获取全局状态
+  setAppState(f: ...): void          // 更新全局状态
+  messages: Message[]                // 当前会话消息历史
+}
+```
+
+### checkPermissions()：工具级权限检查
+
+```typescript
+checkPermissions(
+  input: z.infer<Input>,
+  context: ToolUseContext,
+): Promise<PermissionResult>
+```
+
+`checkPermissions()` 是工具的**自我审查**机制。它只包含工具特有的逻辑（比如 BashTool 的危险命令检测）。通用的权限检查链（deny 规则、allow 规则、用户确认弹窗）在外部的 `permissions.ts` 中处理，两者是**分工协作**的关系，而非重复。
+
+`PermissionResult` 可以返回：
+- `{ behavior: 'allow' }` — 直接放行
+- `{ behavior: 'ask', ... }` — 需要用户确认（并附带询问原因）
+- `{ behavior: 'deny', ... }` — 直接拒绝（并告知 Claude 原因）
+
+### validateInput()：输入合法性验证
+
+```typescript
+validateInput?(
+  input: z.infer<Input>,
+  context: ToolUseContext,
+): Promise<ValidationResult>
+```
+
+注意这个方法是**可选的**（`?`）。`validateInput` 只在 Zod schema 验证通过之后才被调用，处理的是 schema 无法表达的业务规则。
+
+典型用例：`FileEditTool` 用它检查 `old_string === new_string`（没有实质修改的编辑），`BashTool` 用它检测 `sleep N` 这类应该走后台的命令。
+
+```typescript
+// 返回类型（Tool.ts 第 95-101 行）
+export type ValidationResult =
+  | { result: true }
+  | {
+      result: false
+      message: string    // 告知 Claude 失败原因
+      errorCode: number  // 内部错误码
+    }
+```
+
+### isConcurrencySafe()：并发安全声明
+
+```typescript
+isConcurrencySafe(input: z.infer<Input>): boolean
+```
+
+这是工具系统里**最有意思的设计**之一。当 Claude 在一轮回复中同时调用多个工具时，`runTools()` 会根据这个方法决定是并行执行还是串行等待。
+
+返回 `true` 意味着：这个工具调用不会改变任何共享状态，可以和其他只读工具并行运行。返回 `false` 则要求串行执行，以避免竞态条件。
+
+注意这个方法**接收 input**：同一个工具在不同输入下可以有不同的并发安全性。`BashTool` 就是这样——读文件的命令并发安全，写文件的命令不是。
+
+### isReadOnly() 与 isDestructive()：操作性质声明
+
+```typescript
+isReadOnly(input: z.infer<Input>): boolean
+isDestructive?(input: z.infer<Input>): boolean  // 可选，默认 false
+```
+
+`isReadOnly` 影响权限检查的严格程度。只读工具不需要用户确认，非只读工具需要。
+
+`isDestructive` 是更强的声明——"这个操作不可逆"（比如删除文件、覆盖写入）。文档注释说得很清楚：
+
+```typescript
+/** Defaults to false. Only set when the tool performs
+ *  irreversible operations (delete, overwrite, send). */
+isDestructive?(input: z.infer<Input>): boolean
+```
+
+### renderToolUseMessage() / renderToolResultMessage()：UI 渲染
+
+```typescript
+// 渲染工具调用请求（参数可能还在流式传输中，所以是 Partial）
+renderToolUseMessage(
+  input: Partial<z.infer<Input>>,
+  options: { theme: ThemeName; verbose: boolean },
+): React.ReactNode
+
+// 渲染工具执行结果（可选）
+renderToolResultMessage?(
+  content: Output,
+  progressMessages: ProgressMessage<P>[],
+  options: { style?: 'condensed'; theme: ThemeName; verbose: boolean },
+): React.ReactNode
+```
+
+两个渲染方法都返回 `React.ReactNode`——Claude Code 的 TUI 基于 React Ink 构建，工具结果直接就是 React 组件。
+
+`renderToolUseMessage` 的 `input` 是 `Partial` 类型，因为工具参数可能还在**流式传输**中（Claude 在 streaming 模式下逐字符发参数），需要在参数完整之前就开始渲染"正在调用 Bash..."这样的动态状态。
+
+### mapToolResultToToolResultBlockParam()：序列化给 Claude API
+
+```typescript
+mapToolResultToToolResultBlockParam(
+  content: Output,
+  toolUseID: string,
+): ToolResultBlockParam
+```
+
+这个方法把工具的强类型输出转换成 Claude API 能接受的格式（`ToolResultBlockParam`）。这是"模型可见的表示"和"UI 可见的表示"的分叉点——同一份数据，对 Claude 和对用户可能呈现完全不同的形式。
+
+## 辅助字段：接口的工程细节
+
+除了核心方法，接口还有几个值得关注的字段：
+
+```typescript
+// 结果大小上限（超过这个值就持久化到磁盘，给 Claude 一个文件路径）
+maxResultSizeChars: number
+
+// 工具别名（重命名后的向后兼容）
+aliases?: string[]
+
+// 工具搜索提示（3-10 个词，帮助 ToolSearch 关键词匹配）
+searchHint?: string
+
+// 是否强制严格模式（API 更严格地遵守 schema）
+readonly strict?: boolean
+
+// 是否延迟加载（需要先用 ToolSearch 才能使用）
+readonly shouldDefer?: boolean
+```
+
+`maxResultSizeChars` 的设计很实用：当命令输出 30KB+ 时，直接塞进上下文会浪费大量 token。工具系统会把结果存到 `~/.claude/tool-results/` 目录，给 Claude 一个带预览的文件路径，让它选择是否用 `FileRead` 读取完整内容。
+
+## 接口设计背后的工程思考
+
+**为什么方法这么多（超过 20 个）？**
+
+工具接口试图在一个地方描述工具的**全部**——执行逻辑、权限、验证、UI、序列化、并发行为。这看起来违反了接口隔离原则，但有它的合理性：Claude Code 的工具是一个**协议**，不是一个普通的策略接口。任何实现这个协议的对象（内置工具、MCP 包装工具）都必须提供统一的完整实现，否则系统就无法一致地处理所有工具。
+
+**为什么用对象字面量而不是类？**
+
+源码中所有工具都用 `buildTool({ ... })` 工厂函数创建对象字面量，而不是 `class BashTool implements Tool`。这种选择：
+- 避免了 `this` 绑定问题（工具方法经常被解构传递）
+- 让 TypeScript 类型推断更精确（对象字面量比类实例有更好的类型收窄）
+- 简化了 MCP 工具的动态创建（不需要 `new`，直接构建对象）
+
+<SourceRef file="source/src/Tool.ts" lines="362-700" />
+
+<ArticleComplete />

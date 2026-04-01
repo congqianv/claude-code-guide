@@ -1,0 +1,329 @@
+---
+sidebar_position: 3
+title: useCanUseTool.tsx 源码解读
+description: 深度解析 Claude Code 权限系统的核心 React Hook，理解响应式权限管理与决策流程
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# useCanUseTool.tsx 源码解读
+
+<DifficultyBadge level="深度" />
+
+`useCanUseTool` 是 Claude Code 权限系统的"神经中枢"——它连接了 React UI 层的状态管理与底层的权限决策逻辑。理解这个 Hook，就能理解权限系统是如何在异步环境中保持响应式的。
+
+## 为什么是 React Hook？
+
+一个合理的疑问：权限检查是"执行时"逻辑，为什么要封装成 React Hook 而不是普通函数？
+
+答案在于 Claude Code 的架构：**整个应用界面由 React (Ink) 驱动，工具调用的确认弹窗是 React 组件**。
+
+权限检查需要：
+1. 将"待确认的工具调用"推入 UI 队列（修改 React 状态）
+2. 等待用户通过 UI 交互做出决策
+3. 将决策结果异步返回给工具执行流程
+
+这是一个典型的"命令式异步操作 + 声明式 UI 响应"的混合模式，React Hook 是最自然的桥梁。
+
+## Hook 的签名
+
+```typescript
+// source/src/hooks/useCanUseTool.tsx
+export type CanUseToolFn<
+  Input extends Record<string, unknown> = Record<string, unknown>,
+> = (
+  tool: ToolType,                    // 工具实例
+  input: Input,                      // 工具调用参数
+  toolUseContext: ToolUseContext,     // 工具执行上下文
+  assistantMessage: AssistantMessage, // 触发此调用的 AI 消息
+  toolUseID: string,                  // 工具调用的唯一 ID
+  forceDecision?: PermissionDecision<Input>,  // 强制指定决策（测试/覆盖用）
+) => Promise<PermissionDecision<Input>>
+
+function useCanUseTool(
+  setToolUseConfirmQueue: React.Dispatch<...>,     // 控制确认对话框队列
+  setToolPermissionContext: (ctx) => void,          // 更新权限上下文
+): CanUseToolFn
+```
+
+这个 Hook **接受两个 setter 函数**，返回一个**异步权限检查函数**。
+
+两个 setter 的作用：
+- `setToolUseConfirmQueue`：当需要显示确认对话框时，将请求推入队列
+- `setToolPermissionContext`：在权限决策后更新全局权限上下文状态
+
+## React Compiler 优化
+
+源码的第一行就揭示了一个有趣的实现细节：
+
+```typescript
+import { c as _c } from "react/compiler-runtime";
+
+function useCanUseTool(setToolUseConfirmQueue, setToolPermissionContext) {
+  const $ = _c(3)   // 创建一个 3 槽的 memoization 缓存
+  let t0
+  if ($[0] !== setToolPermissionContext || $[1] !== setToolUseConfirmQueue) {
+    // 依赖项变化时重新创建函数
+    t0 = async (tool, input, ...) => { /* ... */ }
+    $[0] = setToolPermissionContext
+    $[1] = setToolUseConfirmQueue
+    $[2] = t0
+  } else {
+    t0 = $[2]  // 使用缓存的函数
+  }
+  return t0
+}
+```
+
+这是 React Compiler（实验性编译器）自动生成的 `useCallback` 优化代码。原始 TypeScript 源码中是：
+
+```typescript
+return useCallback<CanUseToolFn>(
+  async (tool, input, toolUseContext, assistantMessage, toolUseID, forceDecision) => {
+    // ...
+  },
+  [setToolUseConfirmQueue, setToolPermissionContext]
+)
+```
+
+React Compiler 将 `useCallback` 转换为手动的 slots 缓存，避免了不必要的函数重建。**只有当两个 setter 函数引用发生变化时，才重新创建权限检查函数**。这对性能很重要：每次工具调用都会调用这个函数，稳定的引用可以避免闭包泄漏。
+
+## 核心执行流程解析
+
+### 步骤 1：创建权限上下文
+
+```typescript
+const ctx = createPermissionContext(
+  tool,
+  input,
+  toolUseContext,
+  assistantMessage,
+  toolUseID,
+  setToolPermissionContext,
+  createPermissionQueueOps(setToolUseConfirmQueue),  // 对话框队列操作
+)
+```
+
+`createPermissionContext` 创建了一个"一次性"的权限上下文对象，它封装了：
+- 当前工具调用的所有信息（用于显示在确认对话框中）
+- 日志记录函数（`logDecision`、`logCancelled`）
+- 中止检测（`resolveIfAborted`）
+- 结果构建器（`buildAllow`、`cancelAndAbort`）
+
+### 步骤 2：提前中止检测
+
+```typescript
+if (ctx.resolveIfAborted(resolve)) {
+  return  // 请求已被取消（用户按了 Ctrl+C）
+}
+```
+
+这是一个防御性设计：在开始任何异步操作之前，先检查请求是否已经被取消。防止僵尸权限检查占用资源。
+
+### 步骤 3：执行核心权限检查
+
+```typescript
+const decisionPromise =
+  forceDecision !== undefined
+    ? Promise.resolve(forceDecision)      // 强制决策（用于测试）
+    : hasPermissionsToUseTool(            // 正常的权限检查链
+        tool, input, toolUseContext, assistantMessage, toolUseID,
+      )
+```
+
+`hasPermissionsToUseTool` 是真正执行 deny/allow 规则检查的函数（详见上一篇文章）。
+
+`forceDecision` 参数提供了一个测试后门：调用方可以直接传入预设的决策结果，跳过所有规则检查。这在单元测试和 SDK 集成中非常有用。
+
+### 步骤 4：处理 allow 结果
+
+```typescript
+if (result.behavior === 'allow') {
+  if (ctx.resolveIfAborted(resolve)) return
+
+  // 处理 auto 模式（Anthropic 内部功能）的分类器批准记录
+  if (feature('TRANSCRIPT_CLASSIFIER') &&
+      result.decisionReason?.type === 'classifier' &&
+      result.decisionReason.classifier === 'auto-mode') {
+    setYoloClassifierApproval(toolUseID, result.decisionReason.reason)
+  }
+
+  ctx.logDecision({ decision: 'accept', source: 'config' })
+  resolve(ctx.buildAllow(result.updatedInput ?? input, {
+    decisionReason: result.decisionReason,
+  }))
+  return
+}
+```
+
+当权限检查直接返回 `allow` 时（命中了 allow 规则、bypass 模式等），立即 resolve Promise，**不进入后续的 UI 流程**。
+
+`updatedInput` 是一个有趣的特性：allow 决策可以携带"修改后的输入"，允许权限层对工具参数进行净化（sanitize）。
+
+### 步骤 5：处理 deny 结果
+
+```typescript
+case 'deny': {
+  logPermissionDecision(...)
+
+  // auto 模式被拒绝时，记录拒绝原因并发通知
+  if (feature('TRANSCRIPT_CLASSIFIER') &&
+      result.decisionReason?.type === 'classifier') {
+    recordAutoModeDenial({ toolName, display, reason, timestamp })
+    toolUseContext.addNotification?.({
+      key: 'auto-mode-denied',
+      priority: 'immediate',
+      jsx: <><Text color="error">...</Text></>
+    })
+  }
+
+  resolve(result)
+  return
+}
+```
+
+deny 结果直接 resolve，同时记录日志。注意 `auto-mode-denied` 通知——当 AI 分类器拒绝某个操作时，会在 UI 中显示一个红色提示，让用户知道为什么操作被自动拒绝了。
+
+### 步骤 6：处理 ask 结果（最复杂的部分）
+
+当结果是 `ask` 时，进入多层自动化检查流程：
+
+**子步骤 6a：Coordinator 检查**
+
+```typescript
+if (appState.toolPermissionContext.awaitAutomatedChecksBeforeDialog) {
+  const coordinatorDecision = await handleCoordinatorPermission({ ctx, ... })
+  if (coordinatorDecision) {
+    resolve(coordinatorDecision)
+    return  // 后台自动决策成功
+  }
+  // null = 自动检查无法决策，继续走 UI 流程
+}
+```
+
+**子步骤 6b：再次中止检测**
+
+在等待 Coordinator 检查后，再次检测是否被取消（因为异步等待期间用户可能已按 Ctrl+C）。
+
+**子步骤 6c：Swarm Worker 权限转发**
+
+```typescript
+const swarmDecision = await handleSwarmWorkerPermission({
+  ctx, description, ...
+})
+if (swarmDecision) {
+  resolve(swarmDecision)
+  return
+}
+```
+
+**子步骤 6d：投机分类器的"宽限期"**
+
+```typescript
+if (feature('BASH_CLASSIFIER') &&
+    result.pendingClassifierCheck &&
+    tool.name === BASH_TOOL_NAME &&
+    !awaitAutomatedChecksBeforeDialog) {  // 主 Agent 才有这个优化
+
+  const speculativePromise = peekSpeculativeClassifierCheck(input.command)
+  if (speculativePromise) {
+    // 等待分类器结果，最多 2 秒
+    const raceResult = await Promise.race([
+      speculativePromise.then(r => ({ type: 'result', result: r })),
+      new Promise(res => setTimeout(res, 2000, { type: 'timeout' })),
+    ])
+
+    if (ctx.resolveIfAborted(resolve)) return
+
+    if (raceResult.type === 'result' &&
+        raceResult.result.matches &&
+        raceResult.result.confidence === 'high') {
+      // 分类器高置信度通过，跳过 UI 对话框
+      resolve(ctx.buildAllow(input, {
+        decisionReason: {
+          type: 'classifier',
+          classifier: 'bash_allow',
+          reason: `Allowed by prompt rule: "${raceResult.result.matchedDescription}"`,
+        },
+      }))
+      return
+    }
+    // 超时或低置信度 → 显示对话框
+  }
+}
+```
+
+这个"宽限期"（grace period）设计很精妙：Bash 命令在解析阶段就已经启动了后台分类器（`peekSpeculativeClassifierCheck`）。如果分类器在 2 秒内以高置信度给出放行结果，用户根本不会看到确认框。
+
+**子步骤 6e：显示 UI 对话框**
+
+```typescript
+handleInteractivePermission({
+  ctx,
+  description,
+  result,
+  awaitAutomatedChecksBeforeDialog,
+  bridgeCallbacks: feature('BRIDGE_MODE') ? appState.replBridgePermissionCallbacks : undefined,
+  channelCallbacks: feature('KAIROS') ? appState.channelPermissionCallbacks : undefined,
+}, resolve)
+```
+
+这是最后的"人工确认"步骤。`handleInteractivePermission` 将确认请求推入 UI 队列，触发 React 状态更新，渲染确认对话框。用户的选择最终通过 `resolve` 回调返回。
+
+## 错误处理
+
+```typescript
+.catch(error => {
+  if (error instanceof AbortError || error instanceof APIUserAbortError) {
+    logForDebugging(`Permission check threw ${error.constructor.name}...`)
+    ctx.logCancelled()
+    resolve(ctx.cancelAndAbort(undefined, true))
+  } else {
+    logError(error)
+    resolve(ctx.cancelAndAbort(undefined, true))
+  }
+})
+.finally(() => {
+  clearClassifierChecking(toolUseID)  // 清理分类器状态
+})
+```
+
+任何错误都会导致权限检查被取消（`cancelAndAbort`），而不是让错误传播出去。这是一个"fail safe"设计：**权限检查出错 = 拒绝执行**，而不是无限等待或意外允许。
+
+## 与 AppStateStore 的关系
+
+`useCanUseTool` 通过两条通道与全局状态交互：
+
+**读取状态：**
+```typescript
+const appState = toolUseContext.getAppState()
+// 读取 toolPermissionContext.mode、awaitAutomatedChecksBeforeDialog 等
+```
+
+**写入状态：**
+```typescript
+// 1. 推入确认对话框队列
+setToolUseConfirmQueue(prev => [...prev, confirmRequest])
+
+// 2. 更新权限上下文（例如用户选择"始终允许"后）
+setToolPermissionContext(newContext)
+```
+
+这种设计将"权限决策逻辑"与"UI 渲染"分离：`useCanUseTool` 负责决策，React 组件负责渲染确认对话框，通过共享状态（`toolUseConfirmQueue`）解耦。
+
+## 并发安全性
+
+一个重要的设计考量：多个工具可以并行调用（`isConcurrencySafe` 返回 true 的工具），这意味着可能同时有多个权限检查在进行。
+
+系统通过以下机制保证并发安全：
+1. `toolUseID` 唯一标识每次工具调用
+2. `resolveIfAborted` 使用 `toolUseID` 检测特定调用是否已取消
+3. `toolUseConfirmQueue` 是一个队列，可以排队显示多个确认框
+4. `clearClassifierChecking(toolUseID)` 在 `finally` 中精确清理每次调用的分类器状态
+
+<SourceRef file="source/src/hooks/useCanUseTool.tsx" lines="1-203" />
+<SourceRef file="source/src/hooks/toolPermission/PermissionContext.js" lines="1-50" />
+
+<ArticleComplete />

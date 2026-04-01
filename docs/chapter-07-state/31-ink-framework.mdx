@@ -1,0 +1,238 @@
+---
+sidebar_position: 1
+title: 为什么用 React 渲染终端？Ink 框架介绍
+description: 深入了解 Claude Code 如何用 React/Ink 构建声明式终端 UI，以及为何这比传统 CLI 输出更优越
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 为什么用 React 渲染终端？Ink 框架介绍
+
+<DifficultyBadge level="入门" />
+
+当你第一次打开 Claude Code，看到它在终端里渲染出带颜色的对话气泡、实时更新的进度条、交互式的权限提示框时，你可能会好奇：这是怎么做到的？毕竟，终端不是浏览器，它没有 DOM，没有 CSS，更没有事件循环。
+
+答案是 **Ink**——一个让你用 React 组件描述终端 UI 的框架。Claude Code 几乎整个交互界面都建立在 Ink 之上。
+
+## 传统 CLI 输出 vs React/Ink 渲染
+
+### 传统方式：命令式、一次性输出
+
+传统的 CLI 工具使用命令式 API 向终端写入内容：
+
+```javascript
+// 传统方式：直接写入 stdout
+process.stdout.write("Processing file...\n");
+process.stdout.write("[##########] 50%\n");
+process.stdout.write("[##########] 100%\n");
+process.stdout.write("Done!\n");
+```
+
+这种方式有几个根本性的局限：
+
+1. **不可更新**：一旦内容写到终端就固定了，要"更新"只能覆写光标位置（需要手动计算 ANSI 转义序列）
+2. **状态与视图耦合**：输出逻辑散落在业务代码里，很难复用
+3. **难以测试**：输出是副作用，测试困难
+4. **复杂布局几乎不可能**：列对齐、嵌套盒子、响应式宽度，靠字符串拼接实现就是噩梦
+
+### Ink 方式：声明式、响应式渲染
+
+Ink 让你像写网页一样写终端 UI：
+
+```tsx
+import { Box, Text } from 'ink';
+
+function ProgressBar({ percent }: { percent: number }) {
+  const filled = Math.round(percent / 10);
+  const bar = '#'.repeat(filled) + '-'.repeat(10 - filled);
+  return (
+    <Box>
+      <Text color="green">[{bar}] {percent}%</Text>
+    </Box>
+  );
+}
+
+// 当 percent 变化时，Ink 自动重新渲染并更新终端输出
+```
+
+当状态变化时，Ink 自动计算差异，只更新终端上需要改变的部分——就像 React 操作虚拟 DOM 一样，Ink 操作"虚拟终端"。
+
+## Ink 框架简介
+
+Ink 由 Vadim Demedes 创建，核心思想是：**将 React 的渲染模型映射到终端的字符网格上**。
+
+### 核心工作原理
+
+```
+React 组件树
+     ↓ React.createElement
+虚拟节点树（Virtual Node Tree）
+     ↓ Ink 自定义 Renderer（基于 react-reconciler）
+终端输出（ANSI 转义码 + 字符定位）
+```
+
+Ink 实现了一个自定义的 React reconciler，不输出 DOM 节点，而是输出终端字符。布局算法基于 **Yoga**——Facebook 开源的跨平台 Flexbox 引擎（也用于 React Native）。
+
+### 核心基础组件
+
+| 组件 | 对应 HTML | 用途 |
+|------|-----------|------|
+| `<Box>` | `<div>` | 容器，支持 flexbox 布局 |
+| `<Text>` | `<span>` | 文本，支持颜色/粗体/斜体 |
+| `<Newline>` | `<br>` | 换行 |
+| `<Spacer>` | `flex: 1` | 弹性空白 |
+
+`Box` 组件支持完整的 Flexbox 属性：
+
+```tsx
+<Box flexDirection="column" padding={1} borderStyle="round" borderColor="blue">
+  <Box justifyContent="space-between">
+    <Text bold>Claude Code</Text>
+    <Text dimColor>v2.1.88</Text>
+  </Box>
+  <Text>Ready for your next task</Text>
+</Box>
+```
+
+### 交互输入：useInput
+
+Ink 提供 `useInput` hook 处理键盘输入：
+
+```tsx
+import { useInput } from 'ink';
+
+function MyPrompt() {
+  useInput((input, key) => {
+    if (key.return) {
+      // 用户按了 Enter
+      handleSubmit();
+    }
+    if (key.escape) {
+      // 用户按了 Esc
+      handleCancel();
+    }
+    if (input === 'y') {
+      // 用户按了 y 键
+      handleYes();
+    }
+  });
+
+  return <Text>Press y to confirm, Esc to cancel</Text>;
+}
+```
+
+这与浏览器中的 `onKeyDown` 事件处理如出一辙，但作用于终端原始输入流。
+
+## Claude Code 中的 Ink 用法
+
+### 入口点：ink 模块的再导出
+
+Claude Code 将 Ink 的核心 API 集中从 `src/ink.js` 导出，组件统一从这里导入：
+
+```tsx
+// source/src/components/permissions/PermissionPrompt.tsx
+import { Box, Text } from '../../ink.js';
+```
+
+### App 组件的结构
+
+顶层 `App` 组件（`source/src/components/App.tsx`）是整个 Ink 渲染树的根：
+
+```tsx
+export function App({ getFpsMetrics, stats, initialState, children }) {
+  return (
+    <FpsMetricsProvider getFpsMetrics={getFpsMetrics}>
+      <StatsProvider store={stats}>
+        <AppStateProvider
+          initialState={initialState}
+          onChangeAppState={onChangeAppState}
+        >
+          {children}
+        </AppStateProvider>
+      </StatsProvider>
+    </FpsMetricsProvider>
+  );
+}
+```
+
+所有的 Provider 包裹在这里，子组件通过 context 或 hooks 获取状态。
+
+### 实际界面示例：权限提示框
+
+当 Claude Code 需要执行一个命令并请求用户确认时，`PermissionDialog` 组件渲染出一个漂亮的边框对话框：
+
+```tsx
+// source/src/components/permissions/PermissionDialog.tsx（简化版）
+export function PermissionDialog({ title, children }) {
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="permission"    // 使用主题色
+      borderLeft={false}
+      borderRight={false}
+      borderBottom={false}
+      marginTop={1}
+    >
+      <Box paddingX={1}>
+        <PermissionRequestTitle title={title} />
+      </Box>
+      <Box flexDirection="column" paddingX={1}>
+        {children}
+      </Box>
+    </Box>
+  );
+}
+```
+
+这段代码渲染出的效果大致是：
+
+```
+╭─────────────────────────────╮
+│ BashTool                    │
+│                             │
+│ Run command: npm test       │
+│                             │
+│ > Yes                       │
+│   No                        │
+│                             │
+│ Esc to cancel               │
+╰─────────────────────────────╯
+```
+
+纯粹的声明式代码，没有任何手动计算光标位置的逻辑。
+
+## 为什么 Claude Code 选择 Ink
+
+### 1. 状态驱动，自动更新
+
+流式输出 AI 回复时，每收到一个 token，只需要更新状态，UI 自动重渲染——与 React 的心智模型完全一致，不需要手动管理输出缓冲区。
+
+### 2. 组件可复用
+
+`PermissionDialog`、`Spinner`、`HighlightedCode` 等组件可以在不同场景下复用，就像 React 组件库一样。查看 `source/src/components/` 目录，里面有超过 100 个独立的 UI 组件。
+
+### 3. 布局系统
+
+Flexbox 布局让"列对齐"、"右对齐"、"响应式宽度"等布局需求变得简单。Claude Code 通过 `useTerminalSize()` hook 获取终端宽度，自动适配不同终端尺寸。
+
+### 4. 可测试性
+
+React 组件可以用 Jest + React Testing Library 测试，不需要真实终端。
+
+### 5. 与 React 生态共享知识
+
+团队已经熟悉 React，Ink 的学习曲线极低。React Compiler（优化重渲染的编译器）同样适用于 Ink 组件——在源码里可以看到大量 `import { c as _c } from "react/compiler-runtime"` 的 Compiler 优化痕迹。
+
+## 小结
+
+Ink 让 Claude Code 的终端 UI 拥有了 Web 前端开发的开发体验：声明式描述界面，状态变化自动更新，组件化复用，Flexbox 布局。这是 Claude Code 能够呈现如此丰富交互界面的基础设施。
+
+下一篇文章将深入 `AppStateStore.ts`，了解 Claude Code 如何用类 Zustand 模式管理全局状态。
+
+<SourceRef file="source/src/components/App.tsx" lines="1-55" />
+<SourceRef file="source/src/components/permissions/PermissionDialog.tsx" lines="1-71" />
+
+<ArticleComplete />

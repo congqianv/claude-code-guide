@@ -1,0 +1,8 @@
+{
+  "label": "第六章：权限系统",
+  "position": 6,
+  "link": {
+    "type": "generated-index",
+    "description": "深入理解 Claude Code 的多层权限系统，从模式配置到决策链完整解析"
+  }
+}

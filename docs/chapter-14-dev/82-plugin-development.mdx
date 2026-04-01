@@ -1,0 +1,333 @@
+---
+sidebar_position: 1
+title: 如何基于 Claude Code 开发插件
+description: 深入讲解 Claude Code 插件系统的架构设计、插件开发流程及完整示例
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 如何基于 Claude Code 开发插件
+
+<DifficultyBadge level="进阶" />
+
+Claude Code 从 v2.x 开始提供了完整的插件系统，允许开发者在不修改核心代码的前提下扩展其能力。本文基于源码深度解析插件系统的架构，并带你从零开发一个可用的插件。
+
+## 插件系统概述
+
+### 插件能做什么
+
+根据 `source/src/utils/plugins/pluginLoader.ts` 的注释，一个插件可以提供以下五类组件：
+
+| 组件类型 | 目录 | 说明 |
+|---|---|---|
+| `commands` | `commands/` | 自定义斜杠命令（Markdown 格式） |
+| `agents` | `agents/` | 自定义 AI Agent（Markdown 格式） |
+| `skills` | `skills/` | 技能（供 `Skill` 工具调用） |
+| `hooks` | `hooks/hooks.json` | 生命周期钩子（pre/post tool use 等） |
+| `output-styles` | `output-styles/` | 自定义输出样式 |
+
+插件还可以通过 `plugin.json` 声明 MCP 服务器配置，让插件携带自己的 MCP 工具集，以及 LSP 语言服务器。
+
+### 插件不能做什么
+
+插件运行在主进程沙箱之内，有以下限制：
+
+- **不能超越主进程的权限模式**：若主进程以 `default` 模式运行，插件的 hooks 无法自动升级为 `bypassPermissions`。
+- **不能访问其他插件的内部状态**：插件之间相互隔离，只能通过公开的命令/技能接口交互。
+- **不能修改核心工具的行为**：无法 monkey-patch `BashTool`、`EditTool` 等内置工具，只能通过 `pre_tool_use` hook 来观测或中止。
+- **命令名称不能与内置命令重名**：加载时会做去重检测，重名的插件命令会被跳过并产生错误。
+
+## 插件文件结构
+
+一个标准的插件目录结构如下：
+
+```
+my-audit-plugin/
+├── plugin.json          # 插件 manifest（可选但推荐）
+├── commands/            # 自定义斜杠命令
+│   ├── audit.md         # /audit 命令
+│   └── report.md        # /report 命令
+├── agents/              # 自定义 Agent
+│   └── security-agent.md
+├── skills/              # 技能（由 Skill 工具发现和调用）
+│   └── SKILL.md
+├── hooks/
+│   └── hooks.json       # hook 配置
+└── output-styles/       # 输出样式（可选）
+    └── compact.md
+```
+
+### plugin.json（Manifest）
+
+Manifest 字段由 `source/src/utils/plugins/schemas.ts` 中的 Zod Schema 定义：
+
+```json
+{
+  "name": "my-audit-plugin",
+  "version": "1.0.0",
+  "description": "为 Claude Code 添加代码审计能力",
+  "author": {
+    "name": "Your Name",
+    "email": "you@example.com"
+  },
+  "mcpServers": {
+    "audit-mcp": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./mcp-server/index.js"]
+    }
+  }
+}
+```
+
+`mcpServers` 字段格式与 `~/.claude/claude_desktop_config.json` 中的 MCP 配置完全一致，插件可以捆绑自己的 MCP 服务器。
+
+## 插件的注册与发现机制
+
+### 安装来源
+
+插件有三种来源，优先级由高到低：
+
+1. **Marketplace 插件**：通过 `/plugin add <plugin@marketplace>` 命令安装，存储在 `~/.claude/plugins/` 目录，配置记录在用户设置中。
+2. **Session-only 插件**：通过 `--plugin-dir` CLI 标志或 SDK `plugins` 选项传入，仅在当前会话生效。
+3. **内置插件（Built-in）**：随 CLI 打包发布，ID 格式为 `{name}@builtin`，在 `/plugin` UI 中单独展示，用户可以启用/禁用。
+
+### 加载流程
+
+```
+loadAllPlugins()
+  ├─ getBuiltinPlugins()          → 加载 @builtin 插件
+  ├─ loadMarketplacePlugins()     → 从 ~/.claude/plugins/ 加载
+  ├─ getAddDirEnabledPlugins()    → 加载 --plugin-dir 插件
+  └─ getInlinePlugins()           → 加载 SDK inline 插件
+```
+
+每个插件加载后产生一个 `LoadedPlugin` 对象（`source/src/types/plugin.ts`）：
+
+```typescript
+type LoadedPlugin = {
+  name: string
+  manifest: PluginManifest
+  path: string              // 文件系统路径
+  source: string            // e.g. "github:owner/repo"
+  repository: string
+  enabled?: boolean
+  isBuiltin?: boolean
+  commandsPath?: string     // commands/ 目录路径
+  skillsPath?: string       // skills/ 目录路径
+  hooksConfig?: HooksSettings
+  mcpServers?: Record<string, McpServerConfig>
+}
+```
+
+## 命令（Commands）的开发
+
+插件命令使用 Markdown 文件定义，文件名即命令名。例如 `commands/audit.md`：
+
+```markdown
+---
+description: 对当前目录进行代码安全审计
+allowedTools:
+  - Read
+  - Bash
+---
+
+# Security Audit
+
+请对以下文件进行安全审计，重点检查：
+1. SQL 注入风险
+2. XSS 漏洞
+3. 不安全的依赖
+
+<$ARGUMENTS>
+```
+
+Frontmatter 支持的字段包括：
+
+- `description`：命令描述，显示在 `/help` 列表中
+- `allowedTools`：该命令允许使用的工具列表（白名单）
+- `model`：指定使用的模型（如 `claude-opus-4-5`）
+- `userInvocable`：是否在 `/help` 中可见（默认 `true`）
+
+## Hooks 配置
+
+插件的 `hooks/hooks.json` 与全局 `~/.claude/hooks.json` 格式完全相同：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /path/to/plugin/hooks/pre-bash.js"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /path/to/plugin/hooks/logger.js"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Hook 命令通过 stdin 接收 JSON 格式的上下文，通过 stdout 返回响应（`allow`/`deny`/`skip`）。
+
+## 完整示例：一个会话日志插件
+
+下面是一个完整的插件，功能是记录每次 tool use 的调用日志到本地文件。
+
+### 目录结构
+
+```
+claude-logger-plugin/
+├── plugin.json
+├── hooks/
+│   └── hooks.json
+└── hooks-scripts/
+    └── logger.js
+```
+
+### plugin.json
+
+```json
+{
+  "name": "claude-logger",
+  "version": "1.0.0",
+  "description": "记录所有工具调用到本地日志文件"
+}
+```
+
+### hooks/hooks.json
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "type": "command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /absolute/path/to/claude-logger-plugin/hooks-scripts/logger.js"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+注意：`hooks.json` 中的路径必须是绝对路径，或者在插件被安装到已知位置后使用相对于插件目录的路径（通过变量替换）。
+
+### hooks-scripts/logger.js
+
+```javascript
+#!/usr/bin/env node
+
+import { readFileSync, appendFileSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
+
+// 从 stdin 读取 hook 上下文
+const chunks = []
+process.stdin.on('data', chunk => chunks.push(chunk))
+process.stdin.on('end', () => {
+  try {
+    const context = JSON.parse(Buffer.concat(chunks).toString())
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      tool: context.tool_name,
+      sessionId: context.session_id,
+      input: context.tool_input,
+      result: context.tool_response?.type,
+    }
+
+    const logPath = join(homedir(), '.claude', 'tool-usage.log')
+    appendFileSync(logPath, JSON.stringify(logEntry) + '\n')
+  } catch (e) {
+    // 忽略错误，不影响主进程
+  }
+
+  // 必须输出 JSON，否则 hook 会报错
+  process.stdout.write(JSON.stringify({ type: 'skip' }))
+})
+```
+
+Hook 响应类型：
+- `{ "type": "skip" }`：不干预，继续正常流程
+- `{ "type": "allow" }`：明确允许
+- `{ "type": "deny", "message": "拒绝原因" }`：中止并返回错误
+
+### 使用方式
+
+```bash
+# 开发时：直接指定插件目录（session-only，不持久化）
+claude --plugin-dir /path/to/claude-logger-plugin
+
+# 正式安装（通过本地 marketplace 或直接 git 路径）
+# 目前官方推荐通过 /plugin add 命令从 marketplace 安装
+```
+
+## 内置插件（Built-in Plugin）开发
+
+若你是 Anthropic 内部开发者或正在开发官方插件，可以使用 `registerBuiltinPlugin()` API：
+
+```typescript
+import { registerBuiltinPlugin } from 'src/plugins/builtinPlugins'
+
+registerBuiltinPlugin({
+  name: 'my-feature',
+  description: '我的内置功能',
+  version: '1.0.0',
+  defaultEnabled: false,   // 默认关闭，用户可在 /plugin UI 中启用
+  isAvailable: () => process.platform === 'darwin', // 仅 macOS 可用
+  skills: [
+    {
+      name: 'my-skill',
+      description: '执行某项技能',
+      content: '技能的 Markdown 提示词内容...',
+      allowedTools: ['Read', 'Bash'],
+    }
+  ],
+  hooks: {
+    PreToolUse: [...],
+  },
+  mcpServers: {
+    'my-server': { type: 'stdio', command: 'node', args: ['server.js'] }
+  }
+})
+```
+
+内置插件 ID 格式为 `{name}@builtin`，在 `/plugin` UI 中单独归类展示。
+
+## 插件的发布与分享
+
+目前 Claude Code 支持以下分发方式：
+
+1. **GitHub 仓库**：通过 `/plugin add` 命令配合 marketplace 安装，用户运行 `/plugin add <name>@<marketplace>` 即可。
+2. **本地目录**：`--plugin-dir` 标志适合开发调试或团队内部分享。
+3. **SDK inline**：通过 SDK API 传入 `plugins` 选项，适合程序化场景。
+
+官方 Marketplace（`claude-code-marketplace`）有严格的审核机制，且名称中包含 `anthropic`、`official` 等词汇的 marketplace 名称会被系统拦截（参见 `schemas.ts` 中的 `BLOCKED_OFFICIAL_NAME_PATTERN`），防止钓鱼插件。
+
+<SourceRef file="source/src/types/plugin.ts" lines="1-70" />
+<SourceRef file="source/src/plugins/builtinPlugins.ts" lines="1-102" />
+<SourceRef file="source/src/utils/plugins/pluginLoader.ts" lines="1-33" />
+
+<ArticleComplete />

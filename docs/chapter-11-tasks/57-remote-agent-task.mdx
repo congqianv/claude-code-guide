@@ -1,0 +1,250 @@
+---
+sidebar_position: 4
+title: RemoteAgentTask：CCR 远程代理通信机制
+description: 解析 Claude Code Remote（CCR）远程代理的架构、通信协议与状态管理
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# RemoteAgentTask：CCR 远程代理通信机制
+
+<DifficultyBadge level="深度" />
+
+`RemoteAgentTask` 是 Claude Code 任务系统中最具创新性的类型。它不在用户的本地机器上运行 AI，而是将任务发送到 Anthropic 的云端基础设施（CCR，Claude Code Remote）上执行。用户可以关闭终端、断开连接，任务在云端持续运行，完成后通过轮询机制将结果带回。
+
+## CCR（Claude Code Remote）是什么？
+
+CCR 是 Claude Code 的云端执行环境。它允许：
+
+1. **长时间运行**：不受本地网络中断、机器关机的影响
+2. **云端资源**：可以使用比本地更强的计算资源
+3. **多种任务类型**：代码审查（ultrareview）、PR 自动修复（autofix-pr）、超级规划（ultraplan）等
+
+源码中定义了 5 种远程任务子类型：
+
+```typescript
+// source/src/tasks/RemoteAgentTask/RemoteAgentTask.tsx
+const REMOTE_TASK_TYPES = [
+  'remote-agent',    // 通用远程代理
+  'ultraplan',       // 超级规划模式（大型架构决策）
+  'ultrareview',     // 全量代码审查（/ultrareview 命令触发）
+  'autofix-pr',      // 自动修复 PR 中的问题
+  'background-pr',   // 后台 PR 处理
+] as const
+```
+
+## RemoteAgentTaskState：远程任务状态
+
+```typescript
+export type RemoteAgentTaskState = TaskStateBase & {
+  type: 'remote_agent'
+  remoteTaskType: RemoteTaskType     // 上面 5 种之一
+  remoteTaskMetadata?: RemoteTaskMetadata // 任务相关元数据（PR 号、仓库等）
+  sessionId: string                  // 云端会话 ID（用于 API 调用）
+  command: string                    // 触发命令（原始用户命令）
+  title: string                      // 任务标题（显示在 UI 上）
+  todoList: TodoList                 // 远程代理的任务清单（实时同步）
+  log: SDKMessage[]                  // 远程代理的消息日志
+  isLongRunning?: boolean            // 是否长时间运行（不在第一个 result 时完成）
+  pollStartedAt: number              // 本地开始轮询的时间戳
+  isRemoteReview?: boolean           // 是否是远程代码审查任务
+  reviewProgress?: {                 // 审查进度（ultrareview 特有）
+    stage?: 'finding' | 'verifying' | 'synthesizing'
+    bugsFound: number
+    bugsVerified: number
+    bugsRefuted: number
+  }
+  isUltraplan?: boolean              // 是否是超级规划任务
+  ultraplanPhase?: Exclude<UltraplanPhase, 'running'> // 规划阶段状态
+}
+```
+
+与本地任务相比，远程任务状态更丰富，因为它需要追踪云端复杂的多阶段执行过程。
+
+## 远程代理 vs 本地代理的核心差异
+
+| 维度 | LocalAgentTask（本地） | RemoteAgentTask（远程） |
+|------|----------------------|------------------------|
+| 执行位置 | 用户本地机器 | Anthropic 云端服务器 |
+| 网络依赖 | 需要连接 Claude API | 需要连接 CCR 服务 |
+| 断连恢复 | 本地进程崩溃则丢失 | 云端持续运行，可恢复 |
+| 通信方式 | 直接函数调用 | HTTP 轮询 + 事件流 |
+| 结果获取 | 完成时直接返回 | 轮询 `pollRemoteSessionEvents` |
+| 身份验证 | Anthropic API Key | Claude.ai 账户（非 Console） |
+| 适用任务 | 短到中等时长任务 | 长时间运行任务（数分钟到数小时） |
+
+## 远程通信协议：HTTP 轮询 + Teleport
+
+远程任务的通信基于 **Teleport** 协议（Anthropic 内部命名），使用 HTTP 轮询模式：
+
+```typescript
+// 轮询远程会话事件
+const events = await pollRemoteSessionEvents(sessionId, offset)
+
+// 会话完成后归档
+await archiveRemoteSession(sessionId)
+```
+
+### 轮询流程
+
+```
+本地 RemoteAgentTask 启动
+    │
+    ├── 创建远程会话（fetchSession → 云端启动代理）
+    ├── 持久化 RemoteAgentMetadata 到磁盘（用于 --resume 恢复）
+    │
+    └── [轮询循环]
+            ├── pollRemoteSessionEvents(sessionId, offset)
+            │       └── GET /api/remote/sessions/{id}/events?offset={n}
+            ├── 处理新事件（工具使用、中间消息、最终结果）
+            ├── 更新 AppState（todoList、log、reviewProgress 等）
+            ├── 等待下一次轮询
+            └── 收到 status=completed → buildTaskNotificationContent()
+                                          └── 通知父代理
+```
+
+`pollStartedAt` 字段记录本地何时开始轮询，而不是任务何时创建——这样当用户通过 `--resume` 恢复会话时，超时计算从"恢复时"开始，而不是从"任务创建时"开始，避免恢复时立即超时。
+
+## 会话持久化：支持断连恢复
+
+远程任务支持**会话恢复**（`--resume`）。实现方式：
+
+### 持久化元数据
+
+每个远程任务创建时，将元数据写入磁盘：
+
+```typescript
+async function persistRemoteAgentMetadata(meta: RemoteAgentMetadata): Promise<void> {
+  await writeRemoteAgentMetadata(meta.taskId, meta)
+}
+```
+
+### 恢复时重建
+
+当用户运行 `claude --resume` 时：
+1. 读取磁盘上的 `RemoteAgentMetadata`
+2. 重建 `RemoteAgentTaskState`
+3. 重新开始轮询远程会话（从断点继续）
+
+```typescript
+const savedMetadata = await listRemoteAgentMetadata()
+// 对每个未完成的远程任务，重建状态并恢复轮询
+```
+
+### 完成后清理
+
+任务完成或被取消后，删除持久化元数据，防止下次启动时错误恢复已结束的任务：
+
+```typescript
+async function removeRemoteAgentMetadata(taskId: string): Promise<void> {
+  await deleteRemoteAgentMetadata(taskId)
+}
+```
+
+## 身份验证与权限控制
+
+远程代理使用 Claude.ai 用户账户进行身份验证（**不是** Anthropic Console 的 API Key）：
+
+```typescript
+// source/src/tasks/RemoteAgentTask/RemoteAgentTask.tsx
+export function formatPreconditionError(error: BackgroundRemoteSessionPrecondition): string {
+  switch (error.type) {
+    case 'not_logged_in':
+      return 'Please run /login and sign in with your Claude.ai account (not Console).'
+    case 'no_remote_environment':
+      // ...
+  }
+}
+```
+
+启动远程代理前，会检查所有前置条件：
+
+```typescript
+export async function checkRemoteAgentEligibility({
+  skipBundle = false
+}: {
+  skipBundle?: boolean;
+} = {}): Promise<RemoteAgentPreconditionResult> {
+  const errors = await checkBackgroundRemoteSessionEligibility({ skipBundle })
+  if (errors.length > 0) {
+    return { eligible: false, errors }
+  }
+  return { eligible: true }
+}
+```
+
+前置条件包括：
+- 用户已登录 Claude.ai 账户
+- 账户具有使用 CCR 的权限
+- 本地代码库已准备好（bundle 打包完成）
+
+## 延迟与可靠性处理
+
+远程任务面临的主要挑战是网络不可靠性：
+
+### 轮询间隔
+
+轮询不是实时推送，而是周期性拉取。间隔根据任务阶段动态调整，避免对服务器造成过大压力，同时保证结果的及时性。
+
+### 超时与重试
+
+代码中实现了 stall 检测——如果远程任务长时间没有新事件，且满足特定条件（如 ultrareview 的阶段检测），会标记任务超时失败。
+
+### 完成检查器机制
+
+对于 `autofix-pr` 等任务，使用了可插拔的完成检查器（completion checker）：
+
+```typescript
+// 注册自定义完成检查器（如检查 PR 状态）
+export function registerCompletionChecker(
+  remoteTaskType: RemoteTaskType,
+  checker: RemoteTaskCompletionChecker
+): void {
+  completionCheckers.set(remoteTaskType, checker)
+}
+
+// 完成检查器签名
+export type RemoteTaskCompletionChecker =
+  (remoteTaskMetadata: RemoteTaskMetadata | undefined) => Promise<string | null>
+  // 返回 null = 继续轮询；返回字符串 = 完成（字符串为通知文本）
+```
+
+这让不同类型的远程任务可以有不同的完成判断逻辑，例如：
+- `ultrareview`：收到结果消息
+- `autofix-pr`：检查对应 PR 是否已创建
+
+## ultrareview 的阶段追踪
+
+`ultrareview` 任务有三个阶段，源码中通过心跳消息追踪：
+
+```xml
+<!-- 远程代理发送的进度心跳 -->
+<remote-review-progress>
+  <stage>finding</stage>     <!-- finding | verifying | synthesizing -->
+  <bugs-found>12</bugs-found>
+  <bugs-verified>8</bugs-verified>
+  <bugs-refuted>3</bugs-refuted>
+</remote-review-progress>
+```
+
+本地解析这些心跳并更新 `reviewProgress` 字段，显示在 UI 的任务状态栏中。
+
+## 远程任务的取消
+
+用户可以通过 `TaskStopTool` 取消正在运行的远程任务：
+
+1. `TaskStopTool.call({ task_id: "r_xxx" })` 被调用
+2. `stopTask()` 触发 `RemoteAgentTask.kill()`
+3. 向 CCR 发送取消请求
+4. 删除持久化的 `RemoteAgentMetadata`
+5. 任务状态更新为 `killed`
+
+## 小结
+
+`RemoteAgentTask` 代表了 Claude Code 从"本地工具"向"云端服务"演进的核心基础设施。通过 HTTP 轮询、会话持久化、断连恢复和多阶段状态追踪，它让 AI 能够处理真正长时间运行的复杂任务，同时保持用户体验的流畅性。这是 Anthropic 构建"AI 软件工程师"愿景中的重要一步。
+
+<SourceRef file="source/src/tasks/RemoteAgentTask/RemoteAgentTask.tsx" lines="1-150" />
+
+<ArticleComplete />

@@ -1,0 +1,266 @@
+---
+sidebar_position: 3
+title: bundledSkills.ts：内置技能 vs 用户自定义技能
+description: 解析内置技能的打包机制、注册流程、文件提取安全设计，以及与用户自定义技能的优先级关系
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# bundledSkills.ts：内置技能 vs 用户自定义技能
+
+<DifficultyBadge level="进阶" />
+
+## 两种技能的本质区别
+
+Claude Code 中存在两类截然不同的技能：
+
+| 特性 | 内置技能（Bundled） | 用户自定义技能（File-based） |
+|------|-----------------|--------------------------|
+| 存储位置 | 编译进 CLI 二进制文件 | 磁盘上的 `SKILL.md` 文件 |
+| 加载时机 | 启动时同步注册 | 首次调用时异步读取 |
+| 提示词来源 | TypeScript 字符串常量 | 文件内容（`fs.readFile`） |
+| 可否修改 | 不可（代码级别） | 可以（直接编辑文件） |
+| 更新方式 | 随 CLI 版本更新 | 用户自行维护 |
+| `source` 字段值 | `'bundled'` | `'userSettings'` / `'projectSettings'` |
+
+## BundledSkillDefinition：注册接口
+
+所有内置技能通过 `registerBundledSkill()` 注册，接受一个 `BundledSkillDefinition` 对象：
+
+```typescript
+// source/src/skills/bundledSkills.ts，第 15-41 行
+export type BundledSkillDefinition = {
+  name: string
+  description: string
+  aliases?: string[]
+  whenToUse?: string
+  argumentHint?: string
+  allowedTools?: string[]
+  model?: string
+  disableModelInvocation?: boolean
+  userInvocable?: boolean
+  isEnabled?: () => boolean      // 动态启用条件
+  hooks?: HooksSettings
+  context?: 'inline' | 'fork'
+  agent?: string
+  /**
+   * 附带的参考文件：键为相对路径，值为文件内容。
+   * 首次调用时解压到磁盘，供模型通过 Read/Grep 工具访问。
+   */
+  files?: Record<string, string>
+  getPromptForCommand: (
+    args: string,
+    context: ToolUseContext,
+  ) => Promise<ContentBlockParam[]>
+}
+```
+
+与文件型技能不同，内置技能的提示词通过 `getPromptForCommand` 函数动态生成，而非从文件读取。这允许内置技能在生成提示词时访问运行时上下文（如当前会话历史、系统状态等）。
+
+## registerBundledSkill：注册流程
+
+```typescript
+// source/src/skills/bundledSkills.ts，第 53-100 行
+export function registerBundledSkill(definition: BundledSkillDefinition): void {
+  const { files } = definition
+
+  let skillRoot: string | undefined
+  let getPromptForCommand = definition.getPromptForCommand
+
+  // 如果有附带文件，包装 getPromptForCommand 以添加文件提取逻辑
+  if (files && Object.keys(files).length > 0) {
+    skillRoot = getBundledSkillExtractDir(definition.name)
+    let extractionPromise: Promise<string | null> | undefined
+
+    const inner = definition.getPromptForCommand
+    getPromptForCommand = async (args, ctx) => {
+      // 懒加载：只在首次调用时提取文件（用 Promise 避免并发竞争）
+      extractionPromise ??= extractBundledSkillFiles(definition.name, files)
+      const extractedDir = await extractionPromise
+      const blocks = await inner(args, ctx)
+      // 在提示词开头添加 "Base directory for this skill: <dir>"
+      if (extractedDir === null) return blocks
+      return prependBaseDir(blocks, extractedDir)
+    }
+  }
+
+  // 构建统一的 Command 对象并推入注册表
+  const command: Command = {
+    type: 'prompt',
+    name: definition.name,
+    source: 'bundled',
+    loadedFrom: 'bundled',
+    contentLength: 0,         // 内置技能不适用（没有文件长度）
+    isHidden: !(definition.userInvocable ?? true),
+    progressMessage: 'running',
+    getPromptForCommand,
+    ...
+  }
+  bundledSkills.push(command)
+}
+```
+
+**懒加载设计**：如果内置技能包含附带文件（`files` 字段），文件不会在注册时立即写入磁盘，而是在**首次调用技能时**才提取。`extractionPromise ??= ...` 这行代码保证了即使多个并发调用同时触发，文件也只被提取一次。
+
+## initBundledSkills：统一初始化入口
+
+所有内置技能在 `source/src/skills/bundled/index.ts` 中统一注册：
+
+```typescript
+// source/src/skills/bundled/index.ts，第 24-79 行
+export function initBundledSkills(): void {
+  registerUpdateConfigSkill()    // /update-config
+  registerKeybindingsSkill()     // /keybindings
+  registerVerifySkill()          // /verify（仅 Anthropic 内部）
+  registerDebugSkill()           // /debug
+  registerLoremIpsumSkill()      // /lorem-ipsum
+  registerSkillifySkill()        // /skillify — 从会话生成技能
+  registerRememberSkill()        // /remember — 内存审查
+  registerSimplifySkill()        // /simplify
+  registerBatchSkill()           // /batch
+  registerStuckSkill()           // /stuck
+
+  // Feature flag 控制的技能：只有对应 flag 开启时才注册
+  if (feature('KAIROS') || feature('KAIROS_DREAM')) {
+    const { registerDreamSkill } = require('./dream.js')
+    registerDreamSkill()
+  }
+  if (feature('AGENT_TRIGGERS')) {
+    const { registerLoopSkill } = require('./loop.js')
+    registerLoopSkill()
+  }
+  if (feature('BUILDING_CLAUDE_APPS')) {
+    const { registerClaudeApiSkill } = require('./claudeApi.js')
+    registerClaudeApiSkill()
+  }
+}
+```
+
+注意 Feature Flag 控制的技能使用的是 **`require()` 懒加载**，而不是顶部 `import`。这是为了避免在 flag 未开启时加载大量不必要的模块。
+
+## 一个真实的内置技能：/skillify
+
+`/skillify` 是个有趣的元技能——它能将当前会话的工作流自动转化为可复用的 Skill 文件：
+
+```typescript
+// source/src/skills/bundled/skillify.ts（简化）
+registerBundledSkill({
+  name: 'skillify',
+  description: 'Convert this session into a reusable skill',
+  getPromptForCommand: async (args, context) => {
+    // 从当前会话历史中提取用户消息
+    const messages = context.getAppState().messages
+    const userMessages = extractUserMessages(
+      getMessagesAfterCompactBoundary(messages)
+    )
+
+    // 获取会话内存摘要
+    const sessionMemory = await getSessionMemoryContent(...)
+
+    // 动态生成包含会话上下文的提示词
+    const prompt = SKILLIFY_PROMPT
+      .replace('{{sessionMemory}}', sessionMemory)
+      .replace('{{userMessages}}', userMessages.join('\n'))
+
+    return [{ type: 'text', text: prompt }]
+  },
+})
+```
+
+这个技能的 `getPromptForCommand` 在运行时访问了 `context.getAppState().messages`——这是**只有内置技能才能做到**的事，文件型技能没有运行时上下文访问能力。
+
+## 附带文件的安全设计
+
+内置技能的 `files` 字段允许打包辅助脚本、配置文件等，在首次调用时解压到磁盘。这个过程有严格的安全设计：
+
+```typescript
+// source/src/skills/bundledSkills.ts，第 176-206 行
+
+// 生成确定性路径（包含进程级 nonce 防止路径预测攻击）
+export function getBundledSkillExtractDir(skillName: string): string {
+  return join(getBundledSkillsRoot(), skillName)
+}
+
+// 安全写文件：使用 O_EXCL（文件必须不存在）+ O_NOFOLLOW（不跟随符号链接）
+const SAFE_WRITE_FLAGS =
+  process.platform === 'win32'
+    ? 'wx'
+    : fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | O_NOFOLLOW
+
+async function safeWriteFile(p: string, content: string): Promise<void> {
+  const fh = await open(p, SAFE_WRITE_FLAGS, 0o600)  // 仅所有者可读写
+  try {
+    await fh.writeFile(content, 'utf8')
+  } finally {
+    await fh.close()
+  }
+}
+
+// 路径穿越防护：禁止 ../ 等路径逃逸
+function resolveSkillFilePath(baseDir: string, relPath: string): string {
+  const normalized = normalize(relPath)
+  if (
+    isAbsolute(normalized) ||
+    normalized.split(pathSep).includes('..') ||
+    normalized.split('/').includes('..')
+  ) {
+    throw new Error(`bundled skill file path escapes skill dir: ${relPath}`)
+  }
+  return join(baseDir, normalized)
+}
+```
+
+安全措施解释：
+- **O_EXCL**：文件已存在时报错（防止覆盖攻击）
+- **O_NOFOLLOW**：目标是符号链接时报错（防止符号链接攻击）
+- **0o700/0o600**：目录和文件仅所有者可访问（防止权限提升）
+- **路径穿越检查**：`..` 等相对路径逃逸会直接抛出错误
+
+## 优先级与覆盖规则
+
+当同名技能同时存在于多个来源时，`loadAllCommands()` 中的加载顺序决定了优先级：
+
+```typescript
+// source/src/commands.ts，第 460-468 行
+return [
+  ...bundledSkills,         // 优先级 1：内置技能
+  ...builtinPluginSkills,   // 优先级 2：内置插件技能
+  ...skillDirCommands,      // 优先级 3：用户/项目技能（后者覆盖前者）
+  ...workflowCommands,      // 优先级 4：工作流命令
+  ...pluginCommands,        // 优先级 5：插件命令
+  ...pluginSkills,          // 优先级 6：插件技能
+  ...COMMANDS(),            // 内置斜杠命令（/help 等）
+]
+```
+
+**等等——内置技能优先级最高？** 是的，在这个数组中，内置技能排在最前面。但这只影响到**命令列表的显示顺序**。实际的技能选择逻辑在 `getCommands()` 中过滤和去重，最终同名技能以**首次出现**为准。
+
+这意味着：如果你创建了一个名为 `verify` 的用户技能，它**不会**覆盖内置的 `/verify`——内置的会先注册，占据命名空间。要覆盖内置技能，需要使用不同的名字，或者通过插件机制。
+
+但是，在 `skillDirCommands` 内部，**项目级技能**（`projectSettings`）会在用户技能（`userSettings`）之后加载，但因为去重是按"首次出现"原则，实际上用户技能（位于 `~/.claude/skills/`）优先于项目技能（位于 `.claude/skills/`）——因为用户技能在数组中更靠前：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 717-723 行
+const allSkillsWithPaths = [
+  ...managedSkills,           // 管理策略（最高优先）
+  ...userSkills,              // 用户技能
+  ...projectSkillsNested.flat(), // 项目技能（后加载，被用户技能覆盖）
+  ...additionalSkillsNested.flat(),
+  ...legacyCommands,
+]
+```
+
+## 用户技能目录位置速查
+
+| 技能类型 | 目录路径 | 作用范围 |
+|---------|---------|---------|
+| 管理员策略 | `<managed>/.claude/skills/` | 全局强制 |
+| 用户个人 | `~/.claude/skills/` | 当前用户 |
+| 项目共享 | `.claude/skills/`（项目根目录） | 当前项目 |
+| 子目录嵌套 | `<任意子目录>/.claude/skills/` | 动态发现 |
+
+<SourceRef file="source/src/skills/bundledSkills.ts" lines="53-100" />
+
+<ArticleComplete />

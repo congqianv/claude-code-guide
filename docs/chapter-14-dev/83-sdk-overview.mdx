@@ -1,0 +1,377 @@
+---
+sidebar_position: 2
+title: SDK 接口总览：coreTypes、settingsTypes、toolTypes
+description: 全面解析 Claude Code SDK 的公开类型接口，学习如何程序化使用 Claude Code
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# SDK 接口总览：coreTypes、settingsTypes、toolTypes
+
+<DifficultyBadge level="进阶" />
+
+Claude Code 提供了一套正式的 SDK 接口，允许开发者以编程方式控制 Claude Code 的行为——不再局限于命令行交互，而是可以将其嵌入 CI/CD 流水线、测试框架、自定义工具链中。本文带你系统了解 SDK 的类型体系。
+
+## SDK 定位
+
+Claude Code SDK 的核心文件位于 `source/src/entrypoints/sdk/`：
+
+```
+sdk/
+├── coreSchemas.ts           # Zod Schema（类型的单一数据源）
+├── coreTypes.ts             # 公开核心类型（re-export generated + extras）
+├── coreTypes.generated.ts   # 由 scripts/generate-sdk-types.ts 生成
+├── settingsTypes.generated.ts
+├── runtimeTypes.ts          # 非序列化类型（回调、接口）
+├── toolTypes.ts             # 工具类型
+└── controlTypes.ts          # 控制消息类型
+```
+
+SDK 的设计原则：
+
+- **序列化优先**：所有公开类型都是可 JSON 序列化的 plain object，便于跨进程传输。
+- **Schema 驱动**：TypeScript 类型由 Zod Schema 自动生成（`coreSchemas.ts` 是唯一数据源），保证运行时验证与类型检查一致。
+- **沙箱友好**：配合 `@anthropic-ai/sandbox-runtime` 可在受限环境中运行。
+
+## coreTypes：核心类型
+
+`coreTypes.ts` 是 SDK 的基础，它 re-export 了所有生成的类型，以及一些无法用 Zod 表达的工具类型。
+
+### HOOK_EVENTS（Hook 事件枚举）
+
+```typescript
+export const HOOK_EVENTS = [
+  'PreToolUse',
+  'PostToolUse',
+  'PostToolUseFailure',
+  'Notification',
+  'UserPromptSubmit',
+  'SessionStart',
+  'SessionEnd',
+  'Stop',
+  'StopFailure',
+  'SubagentStart',
+  'SubagentStop',
+  'PreCompact',
+  'PostCompact',
+  'PermissionRequest',
+  'PermissionDenied',
+  'Setup',
+  'TeammateIdle',
+  'TaskCreated',
+  'TaskCompleted',
+  'Elicitation',
+  'ElicitationResult',
+  'ConfigChange',
+  'WorktreeCreate',
+  'WorktreeRemove',
+  'InstructionsLoaded',
+  'CwdChanged',
+  'FileChanged',
+] as const
+```
+
+这个常量数组定义了系统中所有可监听的事件类型，既用于 hooks 配置的类型检查，也用于 SDK 消费端的事件订阅。
+
+### PermissionMode
+
+```typescript
+// 来自 coreSchemas.ts 的 PermissionModeSchema
+type PermissionMode =
+  | 'default'              // 标准模式，危险操作需用户确认
+  | 'acceptEdits'          // 自动接受所有文件编辑
+  | 'bypassPermissions'    // 跳过所有权限检查（需 allowDangerouslySkipPermissions）
+  | 'plan'                 // 计划模式，只分析不执行
+  | 'dontAsk'              // 不询问，未预批准则拒绝
+```
+
+### ModelUsage（Token 用量统计）
+
+```typescript
+type ModelUsage = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  webSearchRequests: number
+  costUSD: number
+  contextWindow: number
+  maxOutputTokens: number
+}
+```
+
+### ThinkingConfig（思维链控制）
+
+```typescript
+type ThinkingConfig =
+  | { type: 'adaptive' }                         // Claude 自主决定何时思考（Opus 4.6+）
+  | { type: 'enabled'; budgetTokens?: number }   // 固定思维 token 预算
+  | { type: 'disabled' }                         // 关闭扩展思维
+```
+
+### PermissionResult（权限决策结果）
+
+这是 SDK Host（如 IDE 插件、桌面 App）响应权限请求时需要返回的类型：
+
+```typescript
+type PermissionResult =
+  | {
+      behavior: 'allow'
+      updatedInput?: Record<string, unknown>      // 可修改工具输入
+      updatedPermissions?: PermissionUpdate[]     // 附带权限规则更新
+      toolUseID?: string
+      decisionClassification?: 'user_temporary' | 'user_permanent' | 'user_reject'
+    }
+  | {
+      behavior: 'deny'
+      message: string                             // 拒绝原因（展示给用户）
+      interrupt?: boolean                         // 是否中断整个会话
+      toolUseID?: string
+    }
+```
+
+### MCP 服务器配置
+
+```typescript
+type McpStdioServerConfig = {
+  type?: 'stdio'
+  command: string
+  args?: string[]
+  env?: Record<string, string>
+}
+
+type McpSSEServerConfig = {
+  type: 'sse'
+  url: string
+  headers?: Record<string, string>
+}
+
+type McpHttpServerConfig = {
+  type: 'http'
+  url: string
+  headers?: Record<string, string>
+}
+```
+
+三种 MCP 传输方式，SDK 消费端可以用这些类型来配置 MCP 服务器。
+
+## runtimeTypes：运行时类型
+
+`runtimeTypes.ts` 中定义的类型是非序列化的（包含回调函数等），不会被生成到 `.generated.ts` 中：
+
+```typescript
+// 自定义 MCP 工具定义
+type SdkMcpToolDefinition = {
+  name: string
+  description?: string
+  inputSchema: Record<string, unknown>
+}
+
+// SDK 会话消息格式
+type SessionMessage = {
+  role: 'user' | 'assistant'
+  content: string | MessageParam['content']
+}
+
+// SDK 会话创建选项
+type SDKSessionOptions = {
+  apiKey?: string
+  model?: string
+  maxTurns?: number
+  tools?: SdkMcpToolDefinition[]   // 注入自定义工具
+  systemPrompt?: string
+}
+
+// SDK 会话对象
+type SDKSession = {
+  id: string
+  options: SDKSessionOptions
+  messages: SessionMessage[]
+}
+```
+
+`SDKSessionOptions.tools` 允许 SDK 消费端在不创建 MCP 服务器的情况下直接注入工具定义——这在测试场景中非常有用。
+
+## settingsTypes：配置类型
+
+`settingsTypes.generated.ts`（实际上在开发 stub 中是 `Record<string, unknown>`，生产构建时由 Schema 生成）涵盖了 Claude Code 的所有配置接口。
+
+完整配置结构在 `source/src/utils/settings/types.ts` 中定义（部分字段节选）：
+
+```typescript
+type GlobalSettings = {
+  // 权限配置
+  permissionMode?: PermissionMode
+  allowedTools?: string[]         // 白名单工具
+  deniedTools?: string[]          // 黑名单工具
+
+  // 模型配置
+  model?: string
+  smallModel?: string
+  largeModel?: string
+  thinking?: ThinkingConfig
+
+  // MCP 配置
+  mcpServers?: Record<string, McpServerConfig>
+
+  // 插件状态
+  enabledPlugins?: Record<string, boolean>    // pluginId -> enabled
+
+  // 网络
+  apiKeyHelper?: string           // 自定义 API key 获取命令
+
+  // 钩子
+  hooks?: HooksSettings
+}
+
+type ProjectSettings = {
+  // 项目允许的工具（覆盖用户设置）
+  allowedTools?: string[]
+
+  // 忽略文件配置
+  ignorePatterns?: string[]
+
+  // 项目级 MCP 服务器
+  mcpServers?: Record<string, McpServerConfig>
+}
+```
+
+## SDK 典型使用场景
+
+### 场景一：CI/CD 自动化代码审查
+
+```typescript
+import { spawn } from 'child_process'
+
+async function runCodeReview(prDiff: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const claude = spawn('claude', [
+      '--permission-mode', 'plan',     // 只读模式，不执行写操作
+      '--output-format', 'json',       // 结构化输出
+      '--max-turns', '5',
+      '-p', `请审查以下 PR 变更，指出潜在问题：\n${prDiff}`
+    ])
+
+    let output = ''
+    claude.stdout.on('data', d => { output += d })
+    claude.on('close', code => {
+      if (code === 0) resolve(output)
+      else reject(new Error(`Exit code ${code}`))
+    })
+  })
+}
+```
+
+### 场景二：程序化会话（SDK 直接调用）
+
+若使用官方 SDK 的程序化接口（非 CLI 模式），典型代码如下：
+
+```typescript
+// 使用 SDKSessionOptions 创建受控会话
+const sessionOptions: SDKSessionOptions = {
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  model: 'claude-opus-4-5',
+  maxTurns: 10,
+  systemPrompt: '你是一个代码审查助手，只输出问题列表，不进行修复。',
+  tools: [
+    {
+      name: 'read_file',
+      description: '读取文件内容',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件路径' }
+        },
+        required: ['path']
+      }
+    }
+  ]
+}
+```
+
+### 场景三：自定义 IDE 插件的权限宿主
+
+IDE 插件作为 SDK Host，需要实现 `PermissionResult` 响应：
+
+```typescript
+// IDE 弹窗询问用户是否允许某个 shell 命令
+async function handlePermissionRequest(
+  toolName: string,
+  toolInput: Record<string, unknown>
+): Promise<PermissionResult> {
+  if (toolName === 'Bash') {
+    const cmd = toolInput.command as string
+    const approved = await showDialog(`Claude 想要执行：\n${cmd}`)
+
+    if (approved) {
+      return {
+        behavior: 'allow',
+        decisionClassification: 'user_temporary'
+      }
+    } else {
+      return {
+        behavior: 'deny',
+        message: '用户拒绝执行此命令'
+      }
+    }
+  }
+  return { behavior: 'allow' }
+}
+```
+
+### 场景四：测试自动化
+
+```typescript
+// 为自动化测试注入 mock 工具（无需启动真实 MCP 服务器）
+const testOptions: SDKSessionOptions = {
+  maxTurns: 3,
+  tools: [
+    {
+      name: 'mock_database_query',
+      description: 'Mock DB 查询（测试用）',
+      inputSchema: {
+        type: 'object',
+        properties: { sql: { type: 'string' } },
+        required: ['sql']
+      }
+    }
+  ]
+}
+```
+
+## EXIT_REASONS：退出原因
+
+```typescript
+export const EXIT_REASONS = [
+  'clear',                          // /clear 命令
+  'resume',                         // 恢复上次会话
+  'logout',                         // 注销
+  'prompt_input_exit',              // 用户在提示输入时退出
+  'other',                          // 其他原因
+  'bypass_permissions_disabled',    // bypassPermissions 被禁用
+] as const
+```
+
+SDK Host 可以根据退出原因决定是否重启会话、清除状态或弹出提示。
+
+## 类型生成流程
+
+值得了解的是，`coreTypes.generated.ts` 是**自动生成**的：
+
+```
+coreSchemas.ts (Zod schemas)
+    ↓
+scripts/generate-sdk-types.ts
+    ↓
+coreTypes.generated.ts (TypeScript types, committed to repo)
+```
+
+这确保了运行时 Zod 验证与 TypeScript 类型检查的完全一致性——修改 Schema 就能同步更新类型定义。
+
+<SourceRef file="source/src/entrypoints/sdk/coreTypes.ts" lines="1-63" />
+<SourceRef file="source/src/entrypoints/sdk/coreSchemas.ts" lines="1-350" />
+<SourceRef file="source/src/entrypoints/sdk/runtimeTypes.ts" lines="1-37" />
+
+<ArticleComplete />

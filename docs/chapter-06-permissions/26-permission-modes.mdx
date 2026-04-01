@@ -1,0 +1,259 @@
+---
+sidebar_position: 1
+title: 五种权限模式：default / acceptEdits / bypassPermissions / plan / dontAsk
+description: 全面解析 Claude Code 的五种权限模式，理解每种模式的行为差异、适用场景和安全等级
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 五种权限模式：default / acceptEdits / bypassPermissions / plan / dontAsk
+
+<DifficultyBadge level="入门" />
+
+Claude Code 对每一次工具调用都有严格的权限控制。在执行 `bash` 命令、写入文件、删除内容之前，系统会根据当前"权限模式"（Permission Mode）决定：是自动放行、还是暂停等待用户确认？
+
+理解这五种权限模式，是掌握 Claude Code 安全模型的第一步。
+
+## 五种模式一览
+
+权限模式定义在 `source/src/types/permissions.ts` 中，用一个 TypeScript `const` 数组表示：
+
+```typescript
+// source/src/types/permissions.ts
+export const EXTERNAL_PERMISSION_MODES = [
+  'acceptEdits',
+  'bypassPermissions',
+  'default',
+  'dontAsk',
+  'plan',
+] as const
+
+export type ExternalPermissionMode = (typeof EXTERNAL_PERMISSION_MODES)[number]
+export type PermissionMode = InternalPermissionMode
+// InternalPermissionMode = ExternalPermissionMode | 'auto' | 'bubble'
+```
+
+其中 `auto` 和 `bubble` 是 Anthropic 内部使用的模式，不对外暴露。对于外部用户，可用的五种模式如下：
+
+## 模式行为对比表
+
+| 模式 | 文件读取 | 文件写入/编辑 | 命令执行 | 删除操作 | 安全等级 |
+|------|---------|--------------|---------|---------|---------|
+| `default` | 自动允许 | 需确认 | 需确认 | 需确认 | 高 |
+| `acceptEdits` | 自动允许 | 自动允许 | 需确认 | 需确认 | 中 |
+| `plan` | 自动允许 | 禁止 | 禁止 | 禁止 | 最高（只读） |
+| `dontAsk` | 自动允许 | 自动允许 | 自动允许 | 自动允许 | 低 |
+| `bypassPermissions` | 自动允许 | 自动允许 | 自动允许 | 自动允许 | 最低（无检查） |
+
+> 注意：`dontAsk` 与 `bypassPermissions` 看起来相似，但机制不同——详见下文。
+
+## 逐模式解析
+
+### 1. `default`（默认模式）
+
+这是 Claude Code 启动时的标准模式，也是安全性最高的交互模式。
+
+**行为特征：**
+- 只读操作（`Read`、`Glob`、`Grep` 等）自动放行
+- 文件写入（`Write`、`Edit`）会弹出确认对话框
+- Shell 命令（`Bash`）每次都需要用户确认
+- 用户可以选择"本次允许"或"本会话允许此类操作"
+
+**适用场景：**
+- 日常开发工作
+- 在不完全熟悉的代码库中操作
+- 需要对 AI 行为保持完整感知时
+
+**UI 显示：**
+```typescript
+// source/src/utils/permissions/PermissionMode.ts
+default: {
+  title: 'Default',
+  shortTitle: 'Default',
+  symbol: '',
+  color: 'text',    // 普通文字颜色，无特殊标记
+  external: 'default',
+},
+```
+
+### 2. `acceptEdits`（接受编辑模式）
+
+这是"半自动"模式：文件读写自动放行，但 Shell 命令执行仍需确认。
+
+**行为特征：**
+- `Write`、`Edit`、`MultiEdit` 等文件操作不再弹窗
+- `Bash`、`PowerShell` 等命令执行仍需用户确认
+- 适合"让 AI 帮我批量修改代码，但不要乱执行命令"的场景
+
+**适用场景：**
+- 大规模代码重构（已充分理解 AI 的修改意图）
+- 批量格式化或代码迁移
+- 已经 review 过计划（plan）、准备执行阶段
+
+**UI 显示：**
+```typescript
+acceptEdits: {
+  title: 'Accept edits',
+  shortTitle: 'Accept',
+  symbol: '⏵⏵',
+  color: 'autoAccept',   // 黄色/橙色提示
+  external: 'acceptEdits',
+},
+```
+
+### 3. `plan`（计划模式）
+
+计划模式将 Claude 限制在"只读+规划"状态，任何写操作都被禁止。
+
+**行为特征：**
+- 所有读取操作正常进行（读文件、搜索、分析代码）
+- 写入文件、执行命令、创建/删除文件全部被拒绝
+- Claude 会生成操作计划，但无法自动执行
+- 通过 `EnterPlanModeTool` 进入，通过 `ExitPlanModeTool` 退出
+
+**适用场景：**
+- 在执行前先让 AI 制定详细计划并供用户审核
+- 安全地探索大型代码库而不担心意外修改
+- 代码 review 阶段
+
+**特殊机制：** `plan` 模式退出后，系统会恢复到进入计划模式前的权限模式（存储在 `prePlanMode` 字段中）：
+
+```typescript
+// source/src/types/permissions.ts
+export type ToolPermissionContext = {
+  readonly mode: PermissionMode
+  readonly prePlanMode?: PermissionMode   // 退出 plan 模式后恢复到此
+  // ...
+}
+```
+
+**UI 显示：**
+```typescript
+plan: {
+  title: 'Plan Mode',
+  shortTitle: 'Plan',
+  symbol: PAUSE_ICON,   // 暂停图标，直观表示"停止执行"
+  color: 'planMode',    // 蓝色
+  external: 'plan',
+},
+```
+
+### 4. `dontAsk`（静默允许模式）
+
+`dontAsk` 会跳过所有权限提示，但仍然会执行 deny 规则检查。
+
+**行为特征：**
+- 不再弹出确认对话框
+- 仍然遵守 `alwaysDenyRules`（明确禁止的规则依然有效）
+- allow/deny 规则配置仍然生效
+- 适合自动化脚本场景
+
+**与 `bypassPermissions` 的关键区别：**
+
+| 对比项 | `dontAsk` | `bypassPermissions` |
+|--------|-----------|---------------------|
+| 跳过确认对话框 | 是 | 是 |
+| 遵守 deny 规则 | 是 | 否（完全跳过） |
+| 适用场景 | 自动化但有安全底线 | 完全信任环境 |
+| UI 颜色 | 红色警告 | 红色警告 |
+
+**适用场景：**
+- CI/CD 流水线中运行 Claude Code
+- 脚本化任务且已充分验证操作安全
+- 配合精确的 deny 规则限制危险操作
+
+### 5. `bypassPermissions`（绕过所有权限）
+
+这是权限级别最低的模式，**完全跳过权限检查机制**。
+
+**行为特征：**
+- 所有工具调用直接执行，无任何拦截
+- deny 规则、allow 规则均不生效
+- 无任何用户确认流程
+- 标识为危险模式（UI 使用红色错误色）
+
+**何时使用 `bypassPermissions`？**
+
+官方推荐场景：仅在以下条件**同时满足**时使用：
+1. 运行在完全隔离的沙箱环境（如 Docker 容器）
+2. 无法访问任何生产系统或敏感数据
+3. 脚本化的非交互任务，需要最大执行效率
+
+```typescript
+bypassPermissions: {
+  title: 'Bypass Permissions',
+  shortTitle: 'Bypass',
+  symbol: '⏵⏵',
+  color: 'error',    // 红色错误色，强调危险
+  external: 'bypassPermissions',
+},
+```
+
+**安全警告：** `bypassPermissions` 存在一个"kill switch"机制，定义在 `source/src/utils/permissions/bypassPermissionsKillswitch.ts` 中。这是一个防御性设计——即使在 bypass 模式下，某些极端危险操作（如修改 Claude Code 自身配置）仍然可以被系统层面阻止。
+
+## 如何切换权限模式
+
+### 方法一：CLI 参数
+
+```bash
+# 使用 --permission-mode 标志
+claude --permission-mode bypassPermissions
+claude --permission-mode acceptEdits
+claude --permission-mode plan
+```
+
+### 方法二：settings.json 配置
+
+在用户级别配置（`~/.claude/settings.json`）：
+
+```json
+{
+  "defaultMode": "acceptEdits"
+}
+```
+
+在项目级别配置（`.claude/settings.json`）：
+
+```json
+{
+  "defaultMode": "plan"
+}
+```
+
+### 方法三：会话内切换
+
+在 Claude Code 会话中输入斜杠命令：
+
+```
+/permissions
+```
+
+这会打开权限配置界面，可以在线切换当前会话的权限模式。
+
+### 方法四：进入/退出 Plan 模式
+
+通过内置工具动态切换：
+- 输入 `/plan` 进入计划模式
+- Claude 生成计划后，确认执行时自动切回之前的模式
+
+## 安全等级对比
+
+从最安全到最危险，五种模式排列如下：
+
+```
+plan > default > acceptEdits > dontAsk > bypassPermissions
+(最高)                                              (最低)
+```
+
+对于日常使用，**`default` 是最佳选择**——它在效率与安全之间取得了良好平衡。
+
+`acceptEdits` 适合"我已经理解 AI 在做什么，只是不想频繁确认文件操作"的场景。
+
+`bypassPermissions` 应当只出现在 CI/CD 或完全隔离的测试环境中，**绝不应该在开发机器上长期使用**。
+
+<SourceRef file="source/src/types/permissions.ts" lines="1-40" />
+<SourceRef file="source/src/utils/permissions/PermissionMode.ts" lines="42-91" />
+
+<ArticleComplete />

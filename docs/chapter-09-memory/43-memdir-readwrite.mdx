@@ -1,0 +1,385 @@
+---
+sidebar_position: 3
+title: memdir.ts：记忆的读写与持久化（深度解析）
+description: 逐步解析 memdir.ts 的提示构建、记忆读取、截断处理与多模式调度机制
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# memdir.ts：记忆的读写与持久化（深度解析）
+
+<DifficultyBadge level="深度" />
+
+## 概述
+
+`memdir.ts` 是 memdir 系统的**主入口文件**，承担着记忆提示的构建与调度工作。它负责：
+
+1. 将记忆系统的行为规范（如何保存、何时访问）组装成系统提示文本
+2. 读取 `MEMORY.md` 索引文件并处理截断
+3. 根据功能 flag 调度不同的记忆模式（个人模式、团队模式、KAIROS 日志模式）
+4. 确保记忆目录存在
+
+## 核心常量：记忆索引的容量上限
+
+```typescript
+// source/src/memdir/memdir.ts
+export const ENTRYPOINT_NAME = 'MEMORY.md'
+export const MAX_ENTRYPOINT_LINES = 200
+// ~125 chars/line at 200 lines. At p97 today; catches long-line indexes that
+// slip past the line cap (p100 observed: 197KB under 200 lines).
+export const MAX_ENTRYPOINT_BYTES = 25_000
+```
+
+`MEMORY.md` 是记忆系统的**索引文件**，而非记忆本身。每条记忆是一个独立的 `.md` 文件，`MEMORY.md` 只存储指向这些文件的简短条目，格式为：
+
+```markdown
+- [用户背景](user_background.md) — Go 工程师，对 React 不熟悉
+- [测试策略反馈](feedback_testing.md) — 集成测试用真实 DB
+- [认证重写项目](project_auth_rewrite.md) — 合规要求驱动，2026-04-30
+```
+
+**为什么要有容量上限？**
+
+`MEMORY.md` 会被**整体注入**到每次会话的系统提示中（via claudemd.ts），每次请求都要消耗 token。如果没有上限，随着时间推移 `MEMORY.md` 会无限增长，最终让每次请求的基础 token 成本变得不可接受。
+
+200 行 / 25,000 字节的双重上限是基于实际数据（p97 用户）制定的——大多数用户的记忆不会超过这个范围。
+
+## truncateEntrypointContent：双维度截断
+
+当 `MEMORY.md` 超出容量上限时，`truncateEntrypointContent` 负责截断：
+
+```typescript
+// source/src/memdir/memdir.ts
+export function truncateEntrypointContent(raw: string): EntrypointTruncation {
+  const trimmed = raw.trim()
+  const contentLines = trimmed.split('\n')
+  const lineCount = contentLines.length
+  const byteCount = trimmed.length
+
+  const wasLineTruncated = lineCount > MAX_ENTRYPOINT_LINES
+  const wasByteTruncated = byteCount > MAX_ENTRYPOINT_BYTES
+
+  if (!wasLineTruncated && !wasByteTruncated) {
+    return { content: trimmed, lineCount, byteCount, wasLineTruncated, wasByteTruncated }
+  }
+
+  let truncated = wasLineTruncated
+    ? contentLines.slice(0, MAX_ENTRYPOINT_LINES).join('\n')
+    : trimmed
+
+  if (truncated.length > MAX_ENTRYPOINT_BYTES) {
+    const cutAt = truncated.lastIndexOf('\n', MAX_ENTRYPOINT_BYTES)
+    truncated = truncated.slice(0, cutAt > 0 ? cutAt : MAX_ENTRYPOINT_BYTES)
+  }
+
+  // 追加警告信息
+  const reason = /* ... 根据哪个维度触发生成描述 */
+  return {
+    content: truncated + `\n\n> WARNING: ${ENTRYPOINT_NAME} is ${reason}. Only part of it was loaded...`,
+    // ...
+  }
+}
+```
+
+截断逻辑的几个细节值得关注：
+
+1. **行截断优先**：先按行截断（自然边界），再检查字节
+2. **按最后换行符截断**：字节截断时找 `lastIndexOf('\n', MAX_BYTES)` 而不是硬截断，避免切断中间的行
+3. **字节数检测使用原始值**：注释特别说明 `wasByteTruncated` 基于截断前的原始字节数计算，因为"long lines are the failure mode the byte cap targets"
+4. **追加警告而非静默截断**：截断后会添加警告说明，让 Claude 知道有内容被截断，并提示用户"keep index entries to one line under ~200 chars"
+
+返回类型 `EntrypointTruncation` 包含完整的截断元数据，供调用方记录遥测数据：
+
+```typescript
+export type EntrypointTruncation = {
+  content: string
+  lineCount: number
+  byteCount: number
+  wasLineTruncated: boolean
+  wasByteTruncated: boolean
+}
+```
+
+## buildMemoryLines：组装行为规范提示
+
+`buildMemoryLines` 是构建记忆系统行为规范文本的核心函数，它将多个文本常量按顺序拼接：
+
+```typescript
+// source/src/memdir/memdir.ts
+export function buildMemoryLines(
+  displayName: string,
+  memoryDir: string,
+  extraGuidelines?: string[],
+  skipIndex = false,
+): string[] {
+  const howToSave = skipIndex
+    ? [/* 简化版：直接写文件，不维护 MEMORY.md 索引 */]
+    : [/* 完整版：两步流程 — 写文件 + 更新索引 */]
+
+  const lines: string[] = [
+    `# ${displayName}`,
+    '',
+    `You have a persistent, file-based memory system at \`${memoryDir}\`. ${DIR_EXISTS_GUIDANCE}`,
+    '',
+    "You should build up this memory system over time...",
+    '',
+    ...TYPES_SECTION_INDIVIDUAL,
+    ...WHAT_NOT_TO_SAVE_SECTION,
+    '',
+    ...howToSave,
+    '',
+    ...WHEN_TO_ACCESS_SECTION,
+    '',
+    ...TRUSTING_RECALL_SECTION,
+    '',
+    '## Memory and other forms of persistence',
+    // ...区分 memory vs plan vs tasks
+    ...(extraGuidelines ?? []),
+  ]
+
+  lines.push(...buildSearchingPastContextSection(memoryDir))
+  return lines
+}
+```
+
+`skipIndex` 参数控制是否要求维护 `MEMORY.md` 索引文件。这个 flag 通过 GrowthBook feature flag `tengu_moth_copse` 远程控制。`skipIndex=true` 时，Claude 直接把记忆写到独立文件，不维护索引——适用于文件数量较少的场景。
+
+### DIR_EXISTS_GUIDANCE：消除无效探索
+
+```typescript
+export const DIR_EXISTS_GUIDANCE =
+  'This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).'
+```
+
+这个常量看似简单，但背后有实际的工程考量。注释说明了原因：
+
+> Shipped because Claude was burning turns on `ls`/`mkdir -p` before writing.
+
+没有这句话，Claude 在写记忆时会先执行 `ls` 检查目录、再执行 `mkdir -p` 创建目录、最后才写文件——浪费了 2-3 个工具调用轮次。这句"目录已经存在"的提示消除了这些无效操作。
+
+## buildMemoryPrompt：含内容的完整提示
+
+`buildMemoryPrompt` 在 `buildMemoryLines` 基础上，额外将 `MEMORY.md` 的内容也注入提示中：
+
+```typescript
+// source/src/memdir/memdir.ts
+export function buildMemoryPrompt(params: {
+  displayName: string
+  memoryDir: string
+  extraGuidelines?: string[]
+}): string {
+  const { displayName, memoryDir, extraGuidelines } = params
+  const fs = getFsImplementation()
+  const entrypoint = memoryDir + ENTRYPOINT_NAME
+
+  let entrypointContent = ''
+  try {
+    // 同步读取：提示构建是同步操作
+    entrypointContent = fs.readFileSync(entrypoint, { encoding: 'utf-8' })
+  } catch {
+    // 还没有记忆文件 — 正常情况
+  }
+
+  const lines = buildMemoryLines(displayName, memoryDir, extraGuidelines)
+
+  if (entrypointContent.trim()) {
+    const t = truncateEntrypointContent(entrypointContent)
+    // 记录遥测数据（文件数、截断情况等）
+    logMemoryDirCounts(memoryDir, { ... })
+    lines.push(`## ${ENTRYPOINT_NAME}`, '', t.content)
+  } else {
+    lines.push(
+      `## ${ENTRYPOINT_NAME}`,
+      '',
+      `Your ${ENTRYPOINT_NAME} is currently empty. When you save new memories, they will appear here.`,
+    )
+  }
+
+  return lines.join('\n')
+}
+```
+
+这里有一个重要的**同步读取**：`readFileSync` 而不是 `readFile`。注释说明原因：`buildMemoryPrompt` 会在提示构建流程中调用，而这个流程是同步的。使用 `readFileSync` 保持了调用链的一致性，避免引入 async/await 级联。
+
+两种渲染路径：
+- **有内容**：截断处理 + 注入到提示 + 记录遥测
+- **无内容**：显示友好的空状态提示（"is currently empty"）
+
+## KAIROS 模式：日志式记忆
+
+```typescript
+// source/src/memdir/memdir.ts
+function buildAssistantDailyLogPrompt(skipIndex = false): string {
+  const memoryDir = getAutoMemPath()
+  const logPathPattern = join(memoryDir, 'logs', 'YYYY', 'MM', 'YYYY-MM-DD.md')
+
+  const lines: string[] = [
+    '# auto memory',
+    '',
+    `You have a persistent, file-based memory system found at: \`${memoryDir}\``,
+    '',
+    "This session is long-lived. As you work, record anything worth remembering by **appending** to today's daily log file:",
+    '',
+    `\`${logPathPattern}\``,
+    // ...
+  ]
+}
+```
+
+KAIROS 是 Claude Code 的"助手模式"（长期运行的会话），记忆策略和普通模式不同：
+
+- **普通模式**：直接写结构化记忆文件 + 更新 `MEMORY.md` 索引
+- **KAIROS 模式**：追加写入当天的日志文件（`logs/YYYY/MM/YYYY-MM-DD.md`），由单独的 `/dream` 技能在夜间将日志蒸馏为结构化记忆
+
+日志路径中故意使用了 `YYYY/MM/YYYY-MM-DD.md` 模式字符串而不是实际的当天路径，因为这个提示被系统提示缓存（`systemPromptSection`）复用。如果注入今天的实际日期，缓存就会在每天午夜失效——而模式字符串则永远有效，Claude 会根据上下文中的 `currentDate` 自行推算实际路径。
+
+这是一个提示缓存优化的实际案例：用稳定的模式字符串替代动态值来保持缓存 prefix 的稳定性。
+
+## buildSearchingPastContextSection：过去上下文搜索
+
+```typescript
+// source/src/memdir/memdir.ts
+export function buildSearchingPastContextSection(autoMemDir: string): string[] {
+  if (!getFeatureValue_CACHED_MAY_BE_STALE('tengu_coral_fern', false)) {
+    return []
+  }
+  const projectDir = getProjectDir(getOriginalCwd())
+  const embedded = hasEmbeddedSearchTools() || isReplModeEnabled()
+  const memSearch = embedded
+    ? `grep -rn "<search term>" ${autoMemDir} --include="*.md"`
+    : `${GREP_TOOL_NAME} with pattern="<search term>" path="${autoMemDir}" glob="*.md"`
+  const transcriptSearch = embedded
+    ? `grep -rn "<search term>" ${projectDir}/ --include="*.jsonl"`
+    : `${GREP_TOOL_NAME} with pattern="<search term>" path="${projectDir}/" glob="*.jsonl"`
+  return [
+    '## Searching past context',
+    '',
+    'When looking for past context:',
+    '1. Search topic files in your memory directory:',
+    // ...
+    '2. Session transcript logs (last resort — large files, slow):',
+    // ...
+  ]
+}
+```
+
+这一节为 Claude 提供了两条搜索路径：
+1. 记忆目录（快速）：搜索 `.md` 文件
+2. 会话日志（慢速后备）：搜索 `.jsonl` 格式的历史对话记录
+
+注意平台适配：对于嵌入式搜索工具（如 `ugrep`）或 REPL 模式，生成的是 shell 命令形式；对于普通模式，使用 Grep 工具调用形式。
+
+## loadMemoryPrompt：多模式调度入口
+
+`loadMemoryPrompt` 是整个记忆系统的调度中心，根据多个条件决定使用哪种记忆模式：
+
+```typescript
+// source/src/memdir/memdir.ts
+export async function loadMemoryPrompt(): Promise<string | null> {
+  const autoEnabled = isAutoMemoryEnabled()
+
+  // 1. KAIROS 日志模式优先（长期运行的助手会话）
+  if (feature('KAIROS') && autoEnabled && getKairosActive()) {
+    return buildAssistantDailyLogPrompt(skipIndex)
+  }
+
+  // 2. 团队记忆模式（个人 + 团队双目录）
+  if (feature('TEAMMEM')) {
+    if (teamMemPaths!.isTeamMemoryEnabled()) {
+      await ensureMemoryDirExists(teamDir)
+      return teamMemPrompts!.buildCombinedMemoryPrompt(extraGuidelines, skipIndex)
+    }
+  }
+
+  // 3. 纯个人记忆模式
+  if (autoEnabled) {
+    await ensureMemoryDirExists(autoDir)
+    return buildMemoryLines('auto memory', autoDir, extraGuidelines, skipIndex).join('\n')
+  }
+
+  // 4. 记忆系统完全禁用
+  logEvent('tengu_memdir_disabled', { ... })
+  return null
+}
+```
+
+调度优先级（从高到低）：
+
+```
+KAIROS + 启用 → 日志模式
+  └─ TEAMMEM + 启用 → 联合模式（个人 + 团队）
+       └─ autoEnabled → 纯个人模式
+            └─ 禁用 → null（记录遥测）
+```
+
+注意 KAIROS 和 TEAMMEM 之间有互斥关系：注释说明"日志追加模式与团队同步不兼容（两侧都期望读写同一 MEMORY.md）"，所以 KAIROS 模式优先处理，不会进入 TEAMMEM 分支。
+
+## ensureMemoryDirExists：幂等目录创建
+
+```typescript
+// source/src/memdir/memdir.ts
+export async function ensureMemoryDirExists(memoryDir: string): Promise<void> {
+  const fs = getFsImplementation()
+  try {
+    await fs.mkdir(memoryDir)
+  } catch (e) {
+    // FsOperations.mkdir 内部已处理 EEXIST
+    // 到达这里说明是真正的问题（EACCES/EPERM/EROFS）
+    logForDebugging(`ensureMemoryDirExists failed for ${memoryDir}: ...`, { level: 'debug' })
+  }
+}
+```
+
+这个函数在每次会话开始时调用，确保记忆目录存在。设计要点：
+
+- **幂等**：重复调用安全（`FsOperations.mkdir` 内部已吞掉 `EEXIST`）
+- **递归创建**：一次调用创建完整路径（`~/.claude/projects/xxx/memory/`）
+- **不阻断提示构建**：即使目录创建失败（权限问题），提示构建继续——最终是 Write 工具调用时报告真实错误
+
+## 遥测：logMemoryDirCounts
+
+```typescript
+// source/src/memdir/memdir.ts
+function logMemoryDirCounts(memoryDir: string, baseMetadata: ...): void {
+  const fs = getFsImplementation()
+  void fs.readdir(memoryDir).then(
+    dirents => {
+      let fileCount = 0
+      let subdirCount = 0
+      for (const d of dirents) {
+        if (d.isFile()) fileCount++
+        else if (d.isDirectory()) subdirCount++
+      }
+      logEvent('tengu_memdir_loaded', { ...baseMetadata, total_file_count: fileCount, total_subdir_count: subdirCount })
+    },
+    () => logEvent('tengu_memdir_loaded', baseMetadata),
+  )
+}
+```
+
+注意 `void fs.readdir(...).then(...)` 模式：这是**非阻塞的火后不管（fire-and-forget）**遥测。目录扫描不阻塞提示构建，遥测失败也不影响功能。
+
+`tengu_memdir_loaded` 事件记录了：
+- `memory_type`（auto / team）
+- `total_file_count`（记忆文件总数）
+- `total_subdir_count`（子目录数）
+- `was_truncated` / `was_byte_truncated`（是否触发截断）
+
+这些数据帮助团队了解用户的记忆规模分布，为容量上限的调整提供数据支撑。
+
+## 小结
+
+`memdir.ts` 是记忆系统的**指挥官**：它不存储记忆（存储由 Claude 直接操作文件系统完成），而是：
+
+1. 构建告知 Claude 如何使用记忆系统的系统提示
+2. 将已有的记忆索引注入上下文
+3. 根据运行模式调度不同的提示构建策略
+4. 维护记忆目录的初始化状态
+
+整个系统的核心洞察是：**记忆写入由 Claude 自主完成（通过 Write 工具），框架只负责在合适的时机注入正确的上下文和指令**。这种设计让记忆系统的行为完全由提示文本控制，不需要专门的"记忆写入 API"。
+
+<SourceRef file="source/src/memdir/memdir.ts" lines="34-507" />
+
+<ArticleComplete />

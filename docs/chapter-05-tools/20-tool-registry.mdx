@@ -1,0 +1,200 @@
+---
+sidebar_position: 2
+title: "工具注册表：getAllBaseTools() 与 assembleToolPool()"
+description: 解析工具注册与动态组合的机制，了解 Feature Flag、权限过滤、MCP 合并如何共同构建运行时工具池
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 工具注册表：getAllBaseTools() 与 assembleToolPool()
+
+<DifficultyBadge level="进阶" />
+
+Claude Code 启动时，它需要知道"现在可以用哪些工具"。这个问题比表面上复杂得多：有的工具只在特定环境下启用，有的工具被用户的权限规则屏蔽，还有外部 MCP 服务器动态注入的工具。
+
+`tools.ts` 就是解决这个问题的答案——它不是一个简单的工具数组，而是一套**按条件动态组装工具池**的机制。
+
+## getAllBaseTools()：所有工具的源头
+
+`getAllBaseTools()` 是工具系统的**源真相**（source of truth）。它返回在当前进程环境下**可能存在**的所有工具：
+
+```typescript
+// source/src/tools.ts，第 193 行
+export function getAllBaseTools(): Tools {
+  return [
+    AgentTool,
+    TaskOutputTool,
+    BashTool,
+    // 当嵌入式搜索工具可用时（Ant 内部版本），跳过 Glob/Grep
+    ...(hasEmbeddedSearchTools() ? [] : [GlobTool, GrepTool]),
+    ExitPlanModeV2Tool,
+    FileReadTool,
+    FileEditTool,
+    FileWriteTool,
+    NotebookEditTool,
+    WebFetchTool,
+    TodoWriteTool,
+    WebSearchTool,
+    TaskStopTool,
+    AskUserQuestionTool,
+    SkillTool,
+    EnterPlanModeTool,
+    // ...更多工具
+  ]
+}
+```
+
+注意文件顶部的注释：`NOTE: This MUST stay in sync with ... in order to cache the system prompt across users.`——这个列表的**顺序**直接影响系统提示缓存的命中率，是性能敏感的。
+
+## Feature Flag 控制条件加载
+
+工具注册中最有意思的部分是 Feature Flag 驱动的条件 `require()`：
+
+```typescript
+// source/src/tools.ts，第 16-53 行
+import { feature } from 'bun:bundle'
+
+// SleepTool 只在 PROACTIVE 或 KAIROS 特性开启时加载
+const SleepTool =
+  feature('PROACTIVE') || feature('KAIROS')
+    ? require('./tools/SleepTool/SleepTool.js').SleepTool
+    : null
+
+// WebBrowserTool 只在 WEB_BROWSER_TOOL 开启时加载
+const WebBrowserTool = feature('WEB_BROWSER_TOOL')
+  ? require('./tools/WebBrowserTool/WebBrowserTool.js').WebBrowserTool
+  : null
+
+// WorkflowTool 加载时还会初始化内置工作流
+const WorkflowTool = feature('WORKFLOW_SCRIPTS')
+  ? (() => {
+      require('./tools/WorkflowTool/bundled/index.js').initBundledWorkflows()
+      return require('./tools/WorkflowTool/WorkflowTool.js').WorkflowTool
+    })()
+  : null
+```
+
+`feature()` 来自 `bun:bundle`，是 Bun 打包时的**编译期常量**。当一个 feature flag 为 `false` 时，整个 `require()` 分支在打包产物中被**死代码消除**（Dead Code Elimination）——相关工具的实现代码根本不会进入最终 bundle。
+
+这解释了为什么 `source/bun-bundle-shim.ts` 中有那么多 `false` 的 feature flag——那些工具的实现文件在开发环境中尚未完整，禁用 flag 可以避免加载报错。
+
+## 另一类条件：运行时环境变量
+
+不是所有工具都用 feature flag 控制，有些用运行时环境变量：
+
+```typescript
+// source/src/tools.ts，第 214-232 行
+
+// LSP 工具需要显式开启
+...(isEnvTruthy(process.env.ENABLE_LSP_TOOL) ? [LSPTool] : []),
+
+// Worktree 工具在 Worktree 模式下启用
+...(isWorktreeModeEnabled() ? [EnterWorktreeTool, ExitWorktreeTool] : []),
+
+// Agent Swarms 相关工具
+...(isAgentSwarmsEnabled()
+  ? [getTeamCreateTool(), getTeamDeleteTool()]
+  : []),
+
+// 内部测试工具只在测试环境出现
+...(process.env.NODE_ENV === 'test' ? [TestingPermissionTool] : []),
+
+// Ant 内部专属工具（外部用户不会看到）
+...(process.env.USER_TYPE === 'ant' ? [ConfigTool] : []),
+```
+
+Feature flag 与环境变量的区别：
+- **Feature flag**：打包时确定，控制代码是否进入 bundle（性能 + 安全隔离）
+- **环境变量**：运行时确定，控制同一 bundle 下的功能开关（部署灵活性）
+
+## getTools()：加上权限过滤
+
+`getAllBaseTools()` 返回的是"所有可能存在的工具"，`getTools()` 在此基础上加了一层权限过滤：
+
+```typescript
+// source/src/tools.ts，第 271 行
+export const getTools = (permissionContext: ToolPermissionContext): Tools => {
+  // 简化模式：只有 Bash、Read、Edit
+  if (isEnvTruthy(process.env.CLAUDE_CODE_SIMPLE)) {
+    const simpleTools: Tool[] = [BashTool, FileReadTool, FileEditTool]
+    return filterToolsByDenyRules(simpleTools, permissionContext)
+  }
+
+  const tools = getAllBaseTools().filter(tool => !specialTools.has(tool.name))
+
+  // 第一步：过滤 deny 规则屏蔽的工具
+  let allowedTools = filterToolsByDenyRules(tools, permissionContext)
+
+  // 第二步：REPL 模式下隐藏原始工具（它们被包装在 VM 里）
+  if (isReplModeEnabled()) {
+    const replEnabled = allowedTools.some(tool =>
+      toolMatchesName(tool, REPL_TOOL_NAME),
+    )
+    if (replEnabled) {
+      allowedTools = allowedTools.filter(
+        tool => !REPL_ONLY_TOOLS.has(tool.name),
+      )
+    }
+  }
+
+  // 第三步：过滤掉 isEnabled() 返回 false 的工具
+  const isEnabled = allowedTools.map(_ => _.isEnabled())
+  return allowedTools.filter((_, i) => isEnabled[i])
+}
+```
+
+`filterToolsByDenyRules()` 的实现值得关注：它不只是按工具名匹配，还支持 MCP 服务器前缀规则。如果用户配置了 `deny: mcp__myserver`，那么 `mcp__myserver__*` 下的所有工具都会被过滤掉——这在 `assembleToolPool()` 中体现得更明显。
+
+## assembleToolPool()：合并 MCP 工具
+
+这是工具系统最终的组装函数，同时处理内置工具和 MCP 工具：
+
+```typescript
+// source/src/tools.ts，第 345 行
+export function assembleToolPool(
+  permissionContext: ToolPermissionContext,
+  mcpTools: Tools,
+): Tools {
+  // 1. 获取内置工具（已经过权限过滤）
+  const builtInTools = getTools(permissionContext)
+
+  // 2. 对 MCP 工具也应用 deny 规则
+  const allowedMcpTools = filterToolsByDenyRules(mcpTools, permissionContext)
+
+  // 3. 排序以稳定提示缓存（关键！）
+  const byName = (a: Tool, b: Tool) => a.name.localeCompare(b.name)
+  return uniqBy(
+    [...builtInTools].sort(byName).concat(allowedMcpTools.sort(byName)),
+    'name',  // 内置工具优先（重名时内置工具胜出）
+  )
+}
+```
+
+排序逻辑的注释解释了为什么要排序：服务器端在内置工具列表末尾设置了缓存断点（cache breakpoint），工具顺序稳定才能保证缓存命中。如果 MCP 工具插入内置工具列表中间，就会导致所有下游缓存失效。
+
+## 工具名称命名规范
+
+MCP 工具的名称格式是 `mcp__{serverName}__{toolName}`，这是 `buildMcpToolName()` 生成的：
+
+```typescript
+// source/src/services/mcp/mcpStringUtils.ts（简化）
+export function buildMcpToolName(serverName: string, toolName: string): string {
+  return `mcp__${normalizeNameForMCP(serverName)}__${normalizeNameForMCP(toolName)}`
+}
+```
+
+`normalizeNameForMCP()` 将服务器名/工具名中的特殊字符替换为下划线，使其符合 Claude API 对工具名的限制（`^[a-zA-Z0-9_-]{1,64}$`）。
+
+这个命名规范还有一个重要作用：用户可以在权限规则里写 `deny: mcp__untrusted_server` 来屏蔽整个 MCP 服务器的所有工具，无需逐一列举。
+
+## 从注册到系统提示
+
+工具池组装完成后，`assembleToolPool()` 的输出会传给 Claude API 的 `tools` 参数。每个工具的 `inputSchema`（Zod schema）会被转换成 JSON Schema，作为 Claude 理解"我可以调用哪些工具、每个工具接受什么参数"的依据。
+
+这就形成了完整的链路：工具注册 → 权限过滤 → MCP 合并 → JSON Schema 生成 → 系统提示 → Claude 调用工具。
+
+<SourceRef file="source/src/tools.ts" lines="1-390" />
+
+<ArticleComplete />

@@ -1,0 +1,246 @@
+---
+sidebar_position: 4
+title: MCP Skills：mcpSkillBuilders.ts 如何把 MCP 资源包装成技能
+description: 解析 MCP Skills 的发现机制、依赖注入设计，以及 MCP 服务器如何通过 skill:// 资源协议暴露可调用的工作流技能
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# MCP Skills：mcpSkillBuilders.ts 如何把 MCP 资源包装成技能
+
+<DifficultyBadge level="深度" />
+
+## MCP Skills 是什么？
+
+MCP（Model Context Protocol）是 Claude Code 用于集成外部工具服务器的标准协议。通常，MCP 服务器提供**工具（Tools）**供 Claude 调用，以及**提示词（Prompts）**作为模板。
+
+而 **MCP Skills** 是一种更进一步的机制：MCP 服务器可以通过特殊的 **`skill://` 资源协议**暴露完整的工作流技能。这些技能被 Claude Code 发现后，会转换为本地技能对象，用户可以用 `/skill-name` 的方式调用，就和本地 `SKILL.md` 技能一样。
+
+**MCP Skills 的特别之处**：
+- 无需本地文件：技能内容存储在远程 MCP 服务器上
+- 动态注册：每次 MCP 服务器连接时自动发现和注册
+- 远程维护：技能作者可以更新 MCP 服务器上的内容，用户自动获得新版本
+- `loadedFrom === 'mcp'`：系统通过此字段区分 MCP 技能和本地技能
+
+## 功能标志控制
+
+MCP Skills 是一个需要 Feature Flag 开启的功能：
+
+```typescript
+// source/src/services/mcp/client.ts，第 117-121 行
+const fetchMcpSkillsForClient = feature('MCP_SKILLS')
+  ? (
+      require('../../skills/mcpSkills.js') as typeof import('../../skills/mcpSkills.js')
+    ).fetchMcpSkillsForClient
+  : null
+```
+
+只有当 `feature('MCP_SKILLS')` 返回 `true` 时，`fetchMcpSkillsForClient` 函数才会被加载。这种设计允许在生产环境中安全地试验新特性，同时不影响未开启该 flag 的用户。
+
+在连接 MCP 服务器时，技能发现与工具发现并行执行：
+
+```typescript
+// source/src/services/mcp/client.ts，第 2171-2179 行
+const [tools, mcpCommands, mcpSkills, resources] = await Promise.all([
+  fetchToolsForClient(client),           // 普通 MCP 工具
+  fetchCommandsForClient(client),        // MCP prompts（提示词模板）
+  feature('MCP_SKILLS') && supportsResources
+    ? fetchMcpSkillsForClient!(client)   // MCP 技能（通过 skill:// 资源发现）
+    : Promise.resolve([]),
+  supportsResources
+    ? fetchResourcesForClient(client)    // MCP 资源列表
+    : Promise.resolve([]),
+])
+const commands = [...mcpCommands, ...mcpSkills]
+```
+
+注意 `supportsResources` 条件——MCP Skills 通过 MCP 的**资源（Resources）** 协议传递，不是通过工具或提示词。服务器必须支持 `resources` 能力才能暴露技能。
+
+## mcpSkillBuilders.ts：打破循环依赖的优雅设计
+
+`mcpSkillBuilders.ts` 是一个简洁但设计精妙的模块，只有 45 行。它解决了一个棘手的**循环依赖问题**：
+
+```
+client.ts → mcpSkills.ts → loadSkillsDir.ts → ... → client.ts
+```
+
+如果 `mcpSkills.ts` 直接 `import` `loadSkillsDir.ts`，就会在 Bun 打包后的二进制中产生循环依赖（bunfs 中的动态 import 路径会解析失败）。
+
+解决方案是引入一个**注册表中间层**：
+
+```typescript
+// source/src/skills/mcpSkillBuilders.ts
+export type MCPSkillBuilders = {
+  createSkillCommand: typeof createSkillCommand
+  parseSkillFrontmatterFields: typeof parseSkillFrontmatterFields
+}
+
+let builders: MCPSkillBuilders | null = null
+
+// loadSkillsDir.ts 在初始化时注册
+export function registerMCPSkillBuilders(b: MCPSkillBuilders): void {
+  builders = b
+}
+
+// mcpSkills.ts 在需要时获取
+export function getMCPSkillBuilders(): MCPSkillBuilders {
+  if (!builders) {
+    throw new Error(
+      'MCP skill builders not registered — loadSkillsDir.ts has not been evaluated yet',
+    )
+  }
+  return builders
+}
+```
+
+依赖关系变为：
+
+```
+client.ts → mcpSkills.ts → mcpSkillBuilders.ts（注册表，无其他依赖）
+                                    ↑ 注册
+                         loadSkillsDir.ts（在模块初始化时调用 registerMCPSkillBuilders）
+```
+
+`loadSkillsDir.ts` 在模块末尾执行注册：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 65 行
+import { registerMCPSkillBuilders } from './mcpSkillBuilders.js'
+
+// 模块初始化时注册（文件末尾）
+registerMCPSkillBuilders({
+  createSkillCommand,
+  parseSkillFrontmatterFields,
+})
+```
+
+由于 `loadSkillsDir.ts` 在启动时被 `commands.ts` 静态 import（而 `commands.ts` 在 REPL 初始化时加载），`registerMCPSkillBuilders` 在任何 MCP 服务器连接之前就已经执行了，所以 `getMCPSkillBuilders()` 在实际使用时不会报错。
+
+## skill:// 资源协议
+
+MCP 服务器通过暴露以 `skill://` 为协议前缀的资源来发布技能。资源的内容遵循与本地 `SKILL.md` 相同的格式：YAML front matter + Markdown 正文。
+
+一个 MCP 服务器可能暴露如下资源：
+
+```
+URI: skill://my-server/deploy
+MIME: text/markdown
+
+---
+description: Deploy the application to production
+allowed-tools: Bash
+when_to_use: Use when you need to deploy changes to production
+---
+
+# Deploy to Production
+
+Run the following deployment pipeline:
+
+1. `./scripts/run-tests.sh` — ensure tests pass
+2. `./scripts/build.sh` — build production artifacts
+3. `./scripts/deploy.sh $ARGUMENTS` — deploy with provided environment
+
+$ARGUMENTS should be: staging|production
+```
+
+`fetchMcpSkillsForClient` 函数（在 `mcpSkills.ts` 中实现）会：
+1. 调用 MCP 服务器的 `resources/list` 方法获取所有资源
+2. 过滤出 URI 以 `skill://` 开头的资源
+3. 读取每个技能资源的内容（`resources/read` 方法）
+4. 使用 `parseSkillFrontmatterFields` 解析 front matter
+5. 用 `createSkillCommand` 构建 `Command` 对象，`loadedFrom` 设为 `'mcp'`
+
+## MCP Skills 的特殊安全限制
+
+MCP Skills 在执行时有一个重要限制——不执行内联 shell 命令（`!`` ` `` 语法）：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 373-396 行（createSkillCommand 的 getPromptForCommand）
+// Security: MCP skills are remote and untrusted — never execute inline
+// shell commands (!`…` / ```! … ```) from their markdown body.
+// ${CLAUDE_SKILL_DIR} is meaningless for MCP skills anyway.
+if (loadedFrom !== 'mcp') {
+  finalContent = await executeShellCommandsInPrompt(
+    finalContent,
+    toolUseContext,
+    `/${skillName}`,
+    shell,
+  )
+}
+```
+
+本地技能（`loadedFrom === 'skills'`）支持在 SKILL.md 中使用反引号语法内联执行 shell 命令，例如在技能加载时动态获取 git 状态：
+
+```markdown
+当前分支: !`git branch --show-current`
+```
+
+但 **MCP 技能不支持这一功能**。原因是 MCP 服务器是远程的、不受信任的来源，允许它们在客户端机器上执行任意 shell 命令会带来严重的安全风险。
+
+## MCP Skills 在命令系统中的位置
+
+`getMcpSkillCommands` 函数用于从 AppState 中提取 MCP 技能：
+
+```typescript
+// source/src/commands.ts，第 547-558 行
+export function getMcpSkillCommands(
+  mcpCommands: readonly Command[],
+): readonly Command[] {
+  if (feature('MCP_SKILLS')) {
+    return mcpCommands.filter(
+      cmd =>
+        cmd.type === 'prompt' &&
+        cmd.loadedFrom === 'mcp' &&
+        !cmd.disableModelInvocation,  // 排除仅供用户调用的技能
+    )
+  }
+  return []
+}
+```
+
+MCP Skills 与本地技能在 `SkillTool` 中合并，供 Claude 模型通过 `Skill` 工具调用：
+
+```typescript
+// source/src/tools/SkillTool/SkillTool.ts，第 82-93 行
+// Only include MCP skills (loadedFrom === 'mcp'), not plain MCP prompts.
+const mcpSkills = context
+  .getAppState()
+  .mcp.commands.filter(cmd => cmd.type === 'prompt' && cmd.loadedFrom === 'mcp')
+
+if (mcpSkills.length === 0) return getCommands(getProjectRoot())
+
+return uniqBy([...localCommands, ...mcpSkills], 'name')
+```
+
+这里的关键过滤条件是 `loadedFrom === 'mcp'`——普通的 MCP Prompts（通过 `prompts/list` 获取的）不会出现在技能列表中，只有通过 `skill://` 资源协议明确标记为技能的才会进入。
+
+## 技能名称的命名约定
+
+MCP 技能的命名遵循 `<server-name>:<skill-name>` 格式，与嵌套目录技能的 `:` 分隔符命名空间一致：
+
+```
+MCP 服务器名: my-deploy-server
+skill:// URI: skill://my-deploy-server/deploy-frontend
+技能名: my-deploy-server:deploy-frontend
+用户调用: /my-deploy-server:deploy-frontend
+```
+
+这种命名规则避免了不同 MCP 服务器的技能之间的命名冲突。
+
+## 与本地技能的对比
+
+| 特性 | 本地 SKILL.md 技能 | MCP Skills |
+|------|-----------------|------------|
+| 技能内容存储 | 本地磁盘 | 远程 MCP 服务器 |
+| 发现方式 | 目录扫描 | `skill://` 资源列表 |
+| 内联 shell 执行 | 支持 | 不支持（安全限制） |
+| `loadedFrom` | `'skills'` | `'mcp'` |
+| 更新方式 | 手动编辑文件 | MCP 服务器推送 |
+| `skillRoot` | 技能目录路径 | `undefined` |
+| Feature Flag | 无（默认启用） | 需要 `MCP_SKILLS` |
+
+<SourceRef file="source/src/skills/mcpSkillBuilders.ts" lines="1-45" />
+
+<ArticleComplete />

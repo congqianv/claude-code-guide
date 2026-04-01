@@ -1,0 +1,261 @@
+---
+sidebar_position: 10
+title: teamMemorySync：团队共享记忆的同步与冲突解决
+description: 深入理解 Claude Code 的团队记忆系统设计，包括私有记忆与共享记忆的区别、路径安全保证，以及多 Agent 并发写入时的一致性机制
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# teamMemorySync：团队共享记忆的同步与冲突解决
+
+<DifficultyBadge level="进阶" />
+
+## 记忆系统的两个维度
+
+Claude Code 的记忆系统分为两个维度：
+
+- **Auto Memory（自动记忆）**：单个用户的私有记忆，存储在 `~/.claude/projects/<project>/memory/`
+- **Team Memory（团队记忆）**：所有团队成员共享的记忆，存储在 `~/.claude/projects/<project>/memory/team/`
+
+在 Swarm 模式下，多个 Teammate 可能同时读写团队记忆文件，这带来了**并发安全**和**数据一致性**的挑战。
+
+Claude Code 通过以下模块管理团队记忆：
+- `memdir/teamMemPaths.ts`：路径计算与安全验证
+- `memdir/teamMemPrompts.ts`：构建记忆系统提示词
+- `memdir/memoryTypes.ts`：记忆类型分类系统
+- `memdir/memdir.ts`：记忆文件读取与加载
+
+## 记忆的四种类型
+
+`memoryTypes.ts` 定义了记忆的分类法：
+
+```typescript
+export const MEMORY_TYPES = [
+  'user',       // 用户信息（始终私有）
+  'feedback',   // 协作反馈（默认私有，明确的项目约定可共享）
+  'project',    // 项目上下文
+  'reference',  // 参考资料
+] as const
+```
+
+每种类型有不同的 `scope`（作用域）规则：
+
+| 类型 | 作用域 | 典型内容 |
+|------|--------|---------|
+| `user` | 始终私有 | 用户角色、偏好、背景知识 |
+| `feedback` | 默认私有，可共享 | 协作方式、代码风格指导 |
+| `project` | 可私有或团队共享 | 架构决策、设计约束 |
+| `reference` | 可私有或团队共享 | 文档链接、API 参考 |
+
+**私有 vs 团队记忆的选择原则**：仅当知识对整个团队都有价值（如项目级约定、构建要求），才保存为团队记忆；个人偏好、用户相关信息始终保持私有。
+
+## 团队记忆的物理存储
+
+```
+~/.claude/projects/{sanitized-project-path}/memory/
+├── MEMORY.md           # 私有记忆索引（入口文件）
+├── user-profile.md     # 私有记忆文件（示例）
+└── team/
+    ├── MEMORY.md       # 团队记忆索引（入口文件）
+    ├── architecture.md # 团队记忆文件（示例）
+    └── conventions.md  # 团队记忆文件（示例）
+```
+
+### 记忆文件格式
+
+每个记忆文件使用 YAML frontmatter + Markdown 内容：
+
+```markdown
+---
+name: API 认证约定
+description: 项目使用 JWT + refresh token 模式的认证规范
+type: project
+scope: team
+---
+
+## 认证流程
+
+1. 使用 `POST /auth/login` 获取 access_token（15分钟有效）和 refresh_token（7天有效）
+2. access_token 放在 Authorization header
+3. 刷新通过 `POST /auth/refresh` 进行
+```
+
+`MEMORY.md` 入口文件是一个索引，每行指向一个记忆文件：
+
+```markdown
+- [API 认证约定](architecture.md) — JWT + refresh token 模式，所有 API 都遵循
+- [代码审查约定](conventions.md) — PR 必须有单元测试，测试覆盖率 > 80%
+```
+
+## 路径安全：防止路径遍历攻击
+
+在 Swarm 模式下，多个 Agent 可以写入记忆文件。这引入了**路径注入**的安全风险：恶意或错误的 Agent 可能尝试写入 `../../etc/passwd` 或通过符号链接逃逸到团队记忆目录之外。
+
+`teamMemPaths.ts` 实现了多层防御：
+
+### 第一层：字符串级别检查
+
+```typescript
+function sanitizePathKey(key: string): string {
+  if (key.includes('\0')) throw new PathTraversalError(`Null byte in path key: "${key}"`)
+
+  // URL 编码遍历（%2e%2e%2f = ../）
+  const decoded = decodeURIComponent(key)
+  if (decoded !== key && (decoded.includes('..') || decoded.includes('/'))) {
+    throw new PathTraversalError(`URL-encoded traversal in path key: "${key}"`)
+  }
+
+  // Unicode 标准化攻击（全角字符 ．．／ 可能规范化为 ../）
+  const normalized = key.normalize('NFKC')
+  if (normalized !== key && (normalized.includes('..') || normalized.includes('/'))) {
+    throw new PathTraversalError(`Unicode-normalized traversal in path key: "${key}"`)
+  }
+
+  if (key.includes('\\')) throw new PathTraversalError(`Backslash in path key: "${key}"`)
+  if (key.startsWith('/')) throw new PathTraversalError(`Absolute path key: "${key}"`)
+  return key
+}
+```
+
+### 第二层：`path.resolve()` + 前缀检查
+
+```typescript
+export function isTeamMemPath(filePath: string): boolean {
+  const resolvedPath = resolve(filePath)  // 消除 .. 段
+  const teamDir = getTeamMemPath()
+  return resolvedPath.startsWith(teamDir)
+}
+```
+
+### 第三层：符号链接解析（最严格）
+
+`path.resolve()` 无法处理符号链接逃逸。攻击者可以在团队记忆目录内创建一个指向外部的符号链接，然后通过它写入任意文件。`realpathDeepestExisting()` 解决了这个问题：
+
+```typescript
+async function realpathDeepestExisting(absolutePath: string): Promise<string> {
+  // 向上遍历目录树，找到最深的已存在祖先
+  // 对该祖先调用 realpath()（解析符号链接）
+  // 将不存在的尾部路径拼接回来
+  // 这样即使目标文件不存在，也能验证父目录没有符号链接逃逸
+  ...
+}
+
+export async function validateTeamMemWritePath(filePath: string): Promise<string> {
+  // 第一层：resolve() 检查
+  const resolvedPath = resolve(filePath)
+  const teamDir = getTeamMemPath()
+  if (!resolvedPath.startsWith(teamDir)) {
+    throw new PathTraversalError(`Path escapes team memory directory: "${filePath}"`)
+  }
+
+  // 第二层：realpath() 符号链接检查
+  const realPath = await realpathDeepestExisting(resolvedPath)
+  if (!(await isRealPathWithinTeamDir(realPath))) {
+    throw new PathTraversalError(`Path escapes team memory directory via symlink: "${filePath}"`)
+  }
+
+  return resolvedPath
+}
+```
+
+## 多 Agent 并发写入的冲突问题
+
+当多个 Teammate 同时发现需要写入相同的团队记忆文件时，会面临**写写冲突**：
+
+```
+Teammate A 读取 conventions.md → 追加内容 A → 写回
+Teammate B 读取 conventions.md → 追加内容 B → 写回（覆盖了 A 的内容！）
+```
+
+### Claude Code 的处理策略
+
+**Claude Code 当前采用"文件系统 + 提示词约束"的策略**，而非实现真正的 CRDT（无冲突复制数据类型）或 OT（操作变换）算法：
+
+1. **独立文件设计**：每条记忆是一个独立文件，减少同一文件的并发写入
+2. **`MEMORY.md` 索引**：通过集中式索引文件组织记忆，写入新记忆只需写新文件 + 更新索引
+3. **提示词约束**：系统提示明确要求 Agent 在写新记忆前检查是否已有可更新的旧记忆：
+   ```
+   - Do not write duplicate memories. First check if there is an existing memory
+     you can update before writing a new one.
+   ```
+
+实际上，Claude Code 将并发冲突的风险通过**设计规避**而非**技术消除**：
+
+- 不同 Teammate 通常负责不同领域的任务，写入不同的记忆文件
+- `MEMORY.md` 索引的更新频率低，冲突窗口小
+- 即使出现冲突，后写者覆盖先写者，信息不会完全丢失（被覆盖的内容仍可从 git 历史中找回）
+
+## 记忆文件特征检测（isTeamMemFile）
+
+在 FileWriteTool 和 FileEditTool 中，会检测要写入的文件是否是团队记忆文件，从而触发特殊处理逻辑：
+
+```typescript
+// teamMemPaths.ts
+export function isTeamMemFile(filePath: string): boolean {
+  return isTeamMemoryEnabled() && isTeamMemPath(filePath)
+}
+```
+
+团队记忆功能受 feature flag（`tengu_herring_clock`）控制，需要同时满足：
+- Auto Memory 功能已启用（通过 settings 或环境变量）
+- `tengu_herring_clock` feature flag 开启
+
+## 记忆提示词的构建
+
+当团队记忆启用时，系统提示词包含一个扩展的记忆指导部分，通过 `buildCombinedMemoryPrompt()` 生成：
+
+```typescript
+export function buildCombinedMemoryPrompt(
+  extraGuidelines?: string[],
+  skipIndex = false,
+): string {
+  const autoDir = getAutoMemPath()   // 私有记忆目录
+  const teamDir = getTeamMemPath()   // 团队记忆目录
+
+  // 包含：
+  // 1. 记忆系统介绍（两个目录：私有 + 团队共享）
+  // 2. 记忆作用域说明（private vs team 的选择规则）
+  // 3. 四种记忆类型的详细说明（XML 格式）
+  // 4. 如何保存记忆（两步骤：写文件 + 更新 MEMORY.md 索引）
+  // 5. 何时访问记忆
+  // 6. 注意事项（不保存敏感数据到团队记忆）
+  ...
+}
+```
+
+## 记忆的加载时机
+
+团队记忆在会话开始时加载，注入到系统提示：
+
+```
+- 私有 MEMORY.md：每次对话开始时读取
+- 团队 team/MEMORY.md：每次对话开始时读取
+- 个别记忆文件：按需读取（通过 Agent 的工具调用）
+```
+
+MEMORY.md 有截断上限保护：
+```typescript
+export const MAX_ENTRYPOINT_LINES = 200
+export const MAX_ENTRYPOINT_BYTES = 25_000
+```
+
+超过限制的内容会被截断，附带警告提示，防止上下文窗口被记忆索引占满。
+
+## 小结
+
+Claude Code 的团队记忆系统展现了一种**务实的设计取向**：
+
+1. **安全优先**：三层路径验证（字符串 + resolve + realpath）防止路径遍历攻击
+2. **设计规避冲突**：每条记忆独立文件，降低并发写入同一文件的概率
+3. **Feature Flag 控制**：团队记忆是可渐进启用的功能，不影响未开启的用户
+4. **提示词驱动**：通过详细的系统提示词引导 Agent 正确使用记忆系统，而非依赖复杂的技术机制
+
+这种设计承认了分布式系统中的"最终一致性"权衡，在实际使用场景中，Teammate 间的任务分工通常足以自然地避免大多数冲突。
+
+<SourceRef file="source/src/memdir/teamMemPaths.ts" lines="1-100" />
+<SourceRef file="source/src/memdir/teamMemPrompts.ts" lines="1-100" />
+<SourceRef file="source/src/memdir/memoryTypes.ts" lines="1-60" />
+
+<ArticleComplete />

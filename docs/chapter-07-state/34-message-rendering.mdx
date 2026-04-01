@@ -1,0 +1,261 @@
+---
+sidebar_position: 4
+title: 消息渲染：每种消息类型如何展示
+description: 深入解析 Claude Code 如何将不同类型的消息（human、assistant、tool_use、tool_result、system）渲染为丰富的终端 UI
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 消息渲染：每种消息类型如何展示
+
+<DifficultyBadge level="进阶" />
+
+Claude Code 的对话界面看起来简洁，但背后的消息渲染系统却相当精密。每一种消息类型都有专属的渲染组件，处理各自的展示逻辑、折叠策略、代码高亮和流式更新。
+
+## 消息类型总览
+
+在 Anthropic API 层面，消息分为 `user` 和 `assistant` 两种角色。但 Claude Code 的内部类型系统将消息分得更细，定义在 `source/src/types/message.ts` 中：
+
+| 内部类型 | API 角色 | 描述 |
+|----------|----------|------|
+| `UserMessage` | `user` | 用户输入（文字/图片/附件等） |
+| `AssistantMessage` | `assistant` | Claude 的回复（文字/思考/工具调用） |
+| `SystemMessage` | 合成 | 系统事件（会话时长、内存保存等） |
+| `ProgressMessage` | 合成 | 工具执行进度 |
+| `ToolResultMessage` | `user` | 工具执行结果（包裹在 user 消息中发给 API） |
+| `CollapsedReadSearchGroup` | 合成 | 折叠后的读文件/搜索分组 |
+
+渲染的总入口是 `source/src/components/Message.tsx`，它根据消息类型分发到具体的子组件。
+
+## Assistant 消息：多 block 渲染
+
+一条 `AssistantMessage` 可以包含多个内容块（blocks），每个 block 类型不同：
+
+### TextBlock：Markdown 渲染
+
+Claude 的文字回复通过 `AssistantTextMessage` 渲染，核心是 `Markdown` 组件（`source/src/components/Markdown.tsx`）。
+
+`Markdown` 组件有几个精心优化的细节：
+
+**快速路径跳过 Markdown 解析**：
+
+```typescript
+// source/src/components/Markdown.tsx（简化）
+const MD_SYNTAX_RE = /[#*`|[>\-_~]|\n\n|^\d+\. |\n\d+\. /;
+
+function hasMarkdownSyntax(s: string): boolean {
+  // 只检查前 500 字符，因为 Markdown 语法通常在开头
+  return MD_SYNTAX_RE.test(s.length > 500 ? s.slice(0, 500) : s);
+}
+```
+
+如果文本不包含任何 Markdown 语法字符，就跳过解析器，直接渲染为纯文本段落。这为大量普通文本响应提供了显著的性能提升。
+
+**Token 缓存避免重复解析**：
+
+```typescript
+// 模块级缓存，最多 500 条
+const TOKEN_CACHE_MAX = 500;
+const tokenCache = new Map<string, Token[]>();
+
+function cachedLexer(content: string): Token[] {
+  const key = hashContent(content);  // 哈希内容而非存储原始字符串
+  const hit = tokenCache.get(key);
+  if (hit) {
+    // 提升到 MRU（最近使用）位置
+    tokenCache.delete(key);
+    tokenCache.set(key, hit);
+    return hit;
+  }
+  // ... 解析并缓存
+}
+```
+
+这个缓存解决了"虚拟滚动重挂载"问题——当用户向上滚动重新看到历史消息时，不需要再次解析相同的 Markdown 内容。
+
+**代码高亮的异步加载**：
+
+代码块的语法高亮是异步的（使用 `cli-highlight` 库），通过 React `Suspense` 集成：
+
+```typescript
+// Suspense 包裹高亮组件，高亮计算期间显示原始代码
+<Suspense fallback={<Text>{code}</Text>}>
+  <HighlightedCode language={lang} code={code} />
+</Suspense>
+```
+
+### ThinkingBlock：扩展思考显示
+
+Claude 3.7 Sonnet 的 `extended_thinking` 功能产生 `ThinkingBlock`，通过 `AssistantThinkingMessage` 渲染，显示为折叠状态（可按 Ctrl+O 展开）：
+
+```tsx
+// 折叠状态：显示 "Thinking..." 加载动画或简短摘要
+<CtrlOToExpand label="Thinking" expanded={isExpanded}>
+  {isExpanded && <HighlightedThinkingText text={thinking} />}
+</CtrlOToExpand>
+```
+
+被 API 编辑过的思考块（`RedactedThinkingBlock`）显示为 "⚠ Redacted thinking"。
+
+### ToolUseBlock：工具调用卡片
+
+当 Claude 调用工具时，`AssistantToolUseMessage` 渲染一个工具调用卡片：
+
+```tsx
+export function AssistantToolUseMessage({
+  param,           // ToolUseBlockParam（含工具名称、输入参数）
+  inProgressToolUseIDs,  // 正在执行的工具 ID 集合
+  progressMessages,      // 工具执行期间的进度消息
+  shouldAnimate,         // 是否显示加载动画
+}) {
+  const tool = findToolByName(tools, param.name);
+
+  // 工具自己定义如何渲染其调用消息
+  return tool.renderToolUseMessage(param.input, {
+    verbose,
+    width: terminalSize.columns,
+  });
+}
+```
+
+每个工具通过 `renderToolUseMessage()` 方法自定义渲染——例如 `BashTool` 显示命令行，`FileEditTool` 显示文件路径和操作类型。
+
+**执行中的加载状态**：
+
+当工具还在执行时（`inProgressToolUseIDs` 中包含该 ID），显示 `ToolUseLoader`——一个闪烁的 shimmer 动画：
+
+```tsx
+{isInProgress && <ToolUseLoader shouldAnimate={shouldAnimate} />}
+```
+
+## User 消息：多种子类型
+
+用户消息的渲染入口是 `UserTextMessage`，它通过解析消息文本中的 XML 标签来判断消息子类型：
+
+```typescript
+export function UserTextMessage({ param, addMargin, verbose }) {
+  // 判断是否是 bash 输出
+  if (param.text.startsWith("<bash-stdout") || param.text.startsWith("<bash-stderr")) {
+    return <UserBashOutputMessage text={param.text} />;
+  }
+
+  // 判断是否是命令消息（/command 形式）
+  if (extractTag(param.text, COMMAND_MESSAGE_TAG)) {
+    return <UserCommandMessage text={param.text} />;
+  }
+
+  // 判断是否是内存相关消息
+  if (param.text.includes('<memory-input>')) {
+    return <UserMemoryInputMessage text={param.text} />;
+  }
+
+  // 普通用户提示
+  return <UserPromptMessage text={param.text} addMargin={addMargin} />;
+}
+```
+
+### 特殊用户消息类型
+
+- **`UserBashInputMessage`**：显示执行的 bash 命令（带前缀 `$ `）
+- **`UserBashOutputMessage`**：显示命令输出（支持长输出折叠）
+- **`UserImageMessage`**：显示图片文件名（终端无法直接显示图片）
+- **`UserTeammateMessage`**：多 Agent 协作时来自队友的消息
+- **`UserChannelMessage`**：通过 Telegram/iMessage 等渠道发来的消息
+
+## System 消息：会话事件通知
+
+`SystemTextMessage` 处理各种系统级事件，每种有独立的展示样式：
+
+```typescript
+export function SystemTextMessage({ message }) {
+  switch (message.subtype) {
+    case 'turn_duration':
+      // 显示本轮耗时、token 数、成本
+      return <TurnDurationMessage message={message} />;
+
+    case 'memory_saved':
+      // 显示 "Memory saved to ~/.claude/..." 的绿色提示
+      return <MemorySavedMessage message={message} />;
+
+    case 'thinking':
+      // 显示思考过程的简要描述
+      return <SystemThinkingMessage message={message} />;
+
+    case 'api_error':
+      return <SystemAPIErrorMessage message={message} />;
+    // ...
+  }
+}
+```
+
+## Tool Result 消息：结果展示
+
+工具执行结果通过 `UserToolResultMessage` 系列组件渲染：
+
+- **`UserToolSuccessMessage`**：成功结果，工具自定义渲染（`renderToolResultMessage()`）
+- **`UserToolErrorMessage`**：失败结果，显示红色错误信息
+- **`UserToolCanceledMessage`**：被用户取消
+- **`UserToolRejectMessage`**：被权限系统拒绝
+
+## 流式渲染：token 逐步到来时的 UI 更新
+
+Claude Code 使用流式 API，AI 的文字是逐个 token 输出的。流式渲染的实现策略：
+
+### 1. 消息对象的原地更新
+
+流式过程中，不是每收到一个 token 就创建新的消息对象，而是直接修改现有消息对象中的文本内容（这是一个有意为之的 mutable 设计）。
+
+### 2. 批量 setState 触发重渲染
+
+收到 token 后，通过节流（throttle）机制批量触发 `setState`，避免每个 token 都触发完整的 React 重渲染。
+
+### 3. Ink 的差量更新
+
+Ink 的渲染机制只更新实际变化的终端字符，不会重绘整个界面。流式文本追加到已有内容时，只有新增的字符需要输出到终端。
+
+### 4. 加载动画的独立时钟
+
+加载动画（如 `ShimmerChar`）使用独立的定时器，与消息内容渲染解耦：
+
+```typescript
+// 20fps shimmer 动画被提取为独立组件，避免污染主渲染周期
+function ClassifierCheckingSubtitle() {
+  const [ref, glimmerIndex] = useShimmerAnimation("requesting", CHECKING_TEXT, false);
+  // 仅这个组件以 50ms 间隔重渲染，不影响父组件
+}
+```
+
+## 折叠与虚拟滚动
+
+对于长消息列表，`VirtualMessageList` 组件实现了虚拟滚动，只渲染当前可见区域的消息。这对于长时间运行的会话（可能产生数百条消息）至关重要。
+
+折叠读文件/搜索操作的分组（`CollapsedReadSearchGroup`）则将多个相邻的 Read/Search 工具调用合并为一条摘要，减少视觉噪音：
+
+```
+# 展开状态（4 条消息）：
+● Read file: src/utils/foo.ts
+● Read file: src/utils/bar.ts
+● Search: pattern "useAppState"
+● Read file: src/state/AppState.tsx
+
+# 折叠状态（1 条消息）：
+● Read 3 files, searched 1 time
+```
+
+## 小结
+
+Claude Code 的消息渲染系统展示了精心的分层设计：
+
+1. **消息类型路由**：`Message.tsx` 作为调度中心，按类型分发
+2. **工具自定义渲染**：每个工具控制自己的 `renderToolUseMessage` 和 `renderToolResultMessage`
+3. **Markdown 渲染优化**：快速路径、Token 缓存、异步代码高亮
+4. **流式友好**：批量更新 + Ink 差量渲染
+5. **折叠策略**：长消息、思考内容、重复工具调用均有折叠机制
+
+<SourceRef file="source/src/components/messages/AssistantTextMessage.tsx" lines="1-30" />
+<SourceRef file="source/src/components/Markdown.tsx" lines="1-70" />
+<SourceRef file="source/src/components/messages/AssistantToolUseMessage.tsx" lines="1-60" />
+
+<ArticleComplete />

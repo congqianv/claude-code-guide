@@ -1,0 +1,8 @@
+{
+  "label": "第七章：状态管理与 UI",
+  "position": 7,
+  "link": {
+    "type": "generated-index",
+    "description": "解析 Claude Code 如何用 React/Ink 构建终端 UI 和 Zustand 管理全局状态"
+  }
+}

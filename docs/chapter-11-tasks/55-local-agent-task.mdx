@@ -1,0 +1,256 @@
+---
+sidebar_position: 2
+title: LocalAgentTask：Agent 工具创建子代理的完整流程
+description: 深入解析 LocalAgentTask 的创建、执行、结果汇报及子代理嵌套机制
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# LocalAgentTask：Agent 工具创建子代理的完整流程
+
+<DifficultyBadge level="深度" />
+
+当用户让 Claude Code 完成一个复杂任务时，AI 可以通过 `AgentTool` 创建一个子代理（subagent），将任务委托出去。这个子代理在内部被表示为一个 `LocalAgentTask`，拥有独立的消息历史、独立的工具执行上下文，完成后通过 XML 消息汇报结果。
+
+本文完整解析从 AgentTool 调用到 LocalAgentTask 完成的全链路流程。
+
+## 什么时候会创建 LocalAgentTask？
+
+当 AI 模型在响应中使用 `Agent` 工具（`tool_use` 类型，名称为 `Agent`）时，Claude Code 会：
+
+1. 检测到工具调用，进入工具执行阶段
+2. `AgentTool` 的 `call()` 方法被调用
+3. 在 AppState 中注册一个新的 `LocalAgentTask`
+4. 启动子代理的查询循环
+5. 立即返回任务 ID 给父代理（异步模式）或等待完成（同步模式）
+
+典型的触发场景：
+
+```
+用户: "帮我重构整个认证模块，同时并行检查所有相关测试是否通过"
+
+AI (父代理):
+  我将同时启动两个子代理：
+  - 子代理1：重构认证模块
+  - 子代理2：检查相关测试
+  [调用 Agent 工具两次]
+```
+
+## LocalAgentTaskState：任务状态结构
+
+每个本地子代理任务的状态包含以下核心字段：
+
+```typescript
+// source/src/tasks/LocalAgentTask/LocalAgentTask.tsx
+export type LocalAgentTaskState = TaskStateBase & {
+  type: 'local_agent'
+  agentId: string           // 子代理的唯一标识（= taskId）
+  // 工具活动追踪
+  progress?: AgentProgress  // 工具调用计数、token 数、最近活动
+  result?: AgentToolResult  // 最终结果（完成时设置）
+  error?: string            // 错误信息（失败时设置）
+  // worktree 支持（可选）
+  worktreePath?: string     // 子代理工作的 git worktree 路径
+  worktreeBranch?: string   // 对应的 git 分支
+}
+```
+
+`agentId` 与 `taskId` 相同，都由 `generateTaskId('local_agent')` 生成，格式为 `a` + 8位随机字符，例如 `a3f8k2m9`。
+
+## 子代理的上下文隔离
+
+这是 LocalAgentTask 最关键的设计决策：**子代理拥有完全独立的消息历史**。
+
+### 隔离的边界
+
+父代理的消息历史**不会**传递给子代理。子代理从一个全新的对话开始，只拥有：
+
+1. **系统提示**：与父代理相同的系统提示（工具描述、权限上下文）
+2. **初始提示（prompt）**：AgentTool 调用时传入的 `prompt` 参数
+3. **工具池**：从父代理继承，但可能经过过滤（Coordinator 模式下有限制）
+
+这种设计的好处是：
+- **避免 context 污染**：父代理与用户的冗长对话不会干扰子代理
+- **降低 token 消耗**：子代理不需要携带整个历史
+- **提高并行效率**：多个子代理可以真正独立运行
+
+### 进度追踪
+
+子代理在运行时会持续更新进度信息：
+
+```typescript
+export type AgentProgress = {
+  toolUseCount: number          // 已调用工具次数
+  tokenCount: number            // 累计消耗 token 数
+  lastActivity?: ToolActivity   // 最近一次工具活动
+  recentActivities?: ToolActivity[] // 最近 5 次工具活动
+  summary?: string              // AI 生成的进度摘要
+}
+```
+
+进度信息会推送到 AppState，UI 层（TUI 的 spinner 面板）实时显示。
+
+## 子代理如何汇报结果给父代理？
+
+子代理完成后，通过 `<task-notification>` XML 格式将结果注入父代理的消息队列。以下是完整的 XML 格式：
+
+```typescript
+// source/src/tasks/LocalAgentTask/LocalAgentTask.tsx
+const notificationXml = `
+<${TASK_NOTIFICATION_TAG}>
+<${TASK_ID_TAG}>${taskId}</${TASK_ID_TAG}>
+<${STATUS_TAG}>${status}</${STATUS_TAG}>
+<${SUMMARY_TAG}>${summary}</${SUMMARY_TAG}>
+${resultSection}
+${usageSection}
+${worktreeSection}
+</${TASK_NOTIFICATION_TAG}>
+`
+```
+
+一个实际的通知消息看起来像这样：
+
+```xml
+<task-notification>
+<task-id>a3f8k2m9</task-id>
+<status>completed</status>
+<summary>Agent "重构认证模块" completed</summary>
+<result>
+已完成认证模块重构：
+- 提取了 TokenValidator 类（src/auth/TokenValidator.ts）
+- 使用依赖注入重构了 AuthService
+- 所有 12 个单元测试通过
+提交哈希：abc123f
+</result>
+<tool-use-id>toolu_01X...</tool-use-id>
+</task-notification>
+```
+
+这个消息以**用户角色**注入父代理的对话流，父代理看到后就可以继续处理。
+
+### 通知的传递机制
+
+```
+子代理完成
+    ↓
+buildTaskNotificationContent() 生成 XML
+    ↓
+enqueuePendingNotification()   放入待发通知队列
+    ↓
+messageQueueManager            在父代理下一个合适时机注入
+    ↓
+父代理收到 <task-notification> 用户消息
+    ↓
+父代理分析结果，决定下一步
+```
+
+`notified` 字段（来自 `TaskStateBase`）防止重复通知——一旦设为 `true`，就不会再次发送同一个任务的通知。
+
+## 子代理的权限继承
+
+子代理**不能超越父代理的权限**。这是安全边界的核心设计：
+
+### 权限继承规则
+
+1. **PermissionMode 传递**：父代理的权限模式（`acceptEdits`、`bypassPermissions` 等）会作为起点传给子代理
+2. **允许规则继承**：父代理已批准的路径前缀，子代理也可以访问
+3. **禁止规则继承**：父代理的拒绝规则，子代理同样受约束
+4. **工具白名单**：在 Coordinator 模式下，Worker 子代理只能使用 `ASYNC_AGENT_ALLOWED_TOOLS` 列表内的工具
+
+在 `AgentTool` 的实现中，子代理的权限上下文是从父代理的 `permissionContext` 派生的：
+
+```typescript
+// 子代理继承父代理的权限上下文
+const childPermissionContext = {
+  ...parentPermissionContext,
+  // 子代理不能拥有比父代理更高的权限
+}
+```
+
+### 工具池过滤
+
+在 Coordinator 模式下，Worker 子代理的可用工具集受到限制：
+
+```typescript
+// source/src/coordinator/coordinatorMode.ts
+const INTERNAL_WORKER_TOOLS = new Set([
+  TEAM_CREATE_TOOL_NAME,    // TeamCreate — 只有协调器可用
+  TEAM_DELETE_TOOL_NAME,    // TeamDelete — 只有协调器可用
+  SEND_MESSAGE_TOOL_NAME,   // SendMessage — 只有协调器可用
+  SYNTHETIC_OUTPUT_TOOL_NAME,
+])
+// Worker 的工具池 = ASYNC_AGENT_ALLOWED_TOOLS - INTERNAL_WORKER_TOOLS
+```
+
+## 子代理嵌套的深度
+
+子代理本身也可以调用 `AgentTool`，创建更深层的子代理。这形成了一个**代理树**结构。
+
+然而，代码中有几个机制限制无限嵌套：
+
+### 1. AbortController 链式传播
+
+每个子代理创建时，会创建一个**子 AbortController**，链接到父代理的 AbortController：
+
+```typescript
+// 创建子代理时
+const childAbortController = createChildAbortController(parentAbortController)
+```
+
+当父代理被取消时，所有子孙代理都会级联取消。
+
+### 2. Token 预算限制
+
+子代理的 token 预算来自父代理的剩余预算。随着嵌套深度增加，可用 token 越来越少，实际上限制了嵌套深度。
+
+### 3. 工具递归防护
+
+某些工具（如 `TeamCreateTool`）在子代理中被禁用，防止无限制地创建新团队和新队友。
+
+## 子代理输出的磁盘持久化
+
+每个子代理的完整对话记录保存在磁盘上：
+
+```typescript
+// 子代理转录路径
+const transcriptPath = getAgentTranscriptPath(asAgentId(agentId))
+
+// 任务输出文件是转录文件的符号链接
+initTaskOutputAsSymlink(agentId, transcriptPath)
+```
+
+这意味着：
+- 即使进程崩溃，转录记录不会丢失
+- `--resume` 功能可以从磁盘恢复子代理的上下文
+- 可通过 `TaskOutputTool` 随时查看子代理的实时输出
+
+## 完整执行流程
+
+```
+AgentTool.call(prompt, ...)
+    │
+    ├── generateTaskId('local_agent') → agentId = "a3f8k2m9"
+    ├── createTaskStateBase() → TaskStateBase
+    ├── initTaskOutputAsSymlink(agentId, transcriptPath)
+    ├── registerTask(taskState, AppState) → 注册到 AppState.tasks
+    │
+    ├── [Async] runLocalAgent(agentId, prompt, tools, ...)
+    │       ├── query() 生成器循环
+    │       ├── 每次工具调用 → updateProgressFromMessage()
+    │       ├── AI 输出最终结果 → SyntheticOutputTool 捕获
+    │       └── 任务完成 → buildTaskNotificationContent()
+    │                        └── enqueuePendingNotification()
+    │
+    └── 返回 taskId 给父代理（异步模式）
+        或等待完成（同步模式，前台代理）
+```
+
+## 小结
+
+`LocalAgentTask` 是 Claude Code 多代理架构的基石。通过完全隔离的消息历史、严格的权限继承、XML 格式的异步通知机制，它实现了安全、可追踪、可并行的子代理委托模式。理解这套机制，是深入掌握 Claude Code 复杂任务处理能力的关键。
+
+<SourceRef file="source/src/tasks/LocalAgentTask/LocalAgentTask.tsx" lines="1-640" />
+
+<ArticleComplete />

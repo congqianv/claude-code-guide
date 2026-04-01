@@ -1,0 +1,291 @@
+---
+sidebar_position: 4
+title: "实战解读：ReadTool / EditTool / WriteTool"
+description: 对比三个文件操作工具的设计差异，理解为什么 EditTool 选择 old_string/new_string 模式，以及不同的权限级别设计
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 实战解读：ReadTool / EditTool / WriteTool
+
+<DifficultyBadge level="进阶" />
+
+文件操作是 Claude Code 最频繁执行的任务。`FileReadTool`、`FileEditTool`、`FileWriteTool` 三个工具构成了完整的文件操作能力。它们看起来功能相近，但在设计上有很多精心的差异。
+
+## 三个工具的功能对比
+
+| | FileReadTool | FileEditTool | FileWriteTool |
+|---|---|---|---|
+| 工具名 | `Read` | `Edit` | `Write` |
+| 主要功能 | 读取文件内容 | 精确字符串替换 | 完整文件写入（新建或覆盖） |
+| isReadOnly | `true` | `false` | `false` |
+| isConcurrencySafe | `true`（只读） | `false`（写入） | `false`（写入） |
+| maxResultSizeChars | `Infinity` | 100,000 | 100,000 |
+| 需要用户确认 | 否 | 是 | 是 |
+| 典型用例 | 查看代码、读取配置 | 修改函数、修复 bug | 创建新文件、重写文件 |
+
+## FileReadTool：不只是 cat
+
+### 输入 Schema
+
+```typescript
+// source/src/tools/FileReadTool/FileReadTool.ts（位于 inputSchema 定义处）
+z.strictObject({
+  file_path: z.string().describe('The absolute path to the file to read'),
+  limit: z.number().optional().describe(
+    'The number of lines to read. Only provide if the file is too large to read at once.',
+  ),
+  offset: z.number().optional().describe(
+    'The line number to start reading from. Only provide if the file is too large to read at once',
+  ),
+})
+```
+
+`offset` 和 `limit` 让 Claude 可以分页读取大文件，而不是把整个文件塞进上下文。
+
+### 特殊文件处理
+
+FileReadTool 不只是简单的 `fs.readFile()`，它对多种文件类型有专门处理：
+
+**阻止危险设备文件**
+
+```typescript
+// source/src/tools/FileReadTool/FileReadTool.ts，第 98 行
+const BLOCKED_DEVICE_PATHS = new Set([
+  '/dev/zero',     // 无限输出，永远不会 EOF
+  '/dev/random',   // 无限随机字节
+  '/dev/urandom',  // 同上
+  '/dev/stdin',    // 阻塞等待输入
+  '/dev/tty',      // 终端设备
+  // ...
+])
+```
+
+读取这些路径会导致进程挂起或上下文被无限数据填满，所以直接拒绝。
+
+**PDF 文件支持**
+
+```typescript
+// 根据扩展名和 API 能力决定处理方式
+if (isPDFExtension(filePath)) {
+  if (isPDFSupported()) {
+    // 将 PDF 作为图片发给 Claude Vision API
+    return await readPDF(fullFilePath, { pages, limit, offset })
+  } else {
+    // 回退：提取纯文本（会丢失格式）
+    return await extractPDFPages(fullFilePath)
+  }
+}
+```
+
+**图片文件支持**
+
+```typescript
+// 图片文件转换为 base64，作为 vision 内容发给 Claude
+if (IMAGE_EXTENSIONS.has(extension)) {
+  const imageBuffer = await readFileAsync(fullFilePath)
+  const resized = await maybeResizeAndDownsampleImageBuffer(imageBuffer, ...)
+  return {
+    type: 'base64_image',
+    data: resized.toString('base64'),
+    mediaType: detectImageFormat(imageBuffer),
+  }
+}
+```
+
+**Jupyter Notebook 支持**
+
+```typescript
+// .ipynb 文件以 JSON 读取后格式化展示
+if (filePath.endsWith('.ipynb')) {
+  const notebook = await readNotebook(fullFilePath)
+  return mapNotebookCellsToToolResult(notebook)
+}
+```
+
+### maxResultSizeChars 为什么是 Infinity？
+
+```typescript
+// source/src/tools/FileReadTool/FileReadTool.ts（buildTool 配置处）
+maxResultSizeChars: Infinity,
+```
+
+注释里解释了原因："Set to Infinity for tools whose output must never be persisted (e.g. Read, where persisting creates a circular Read→file→Read loop)"。
+
+如果读取结果太大就持久化到文件，然后告诉 Claude "请用 FileRead 去读这个文件"——Claude 去读那个文件，结果又太大，又被持久化……这是一个无限循环。所以 FileReadTool 自己管理大文件（通过 `limit` 参数），而不交给通用的持久化机制。
+
+### 文件修改时间戳缓存
+
+```typescript
+// 读取文件后，把内容和时间戳存入缓存
+toolUseContext.readFileState.set(absoluteFilePath, {
+  content: fileContent,
+  timestamp: await getFileModificationTimeAsync(absoluteFilePath),
+  offset,
+  limit,
+})
+```
+
+这个缓存在 `FileEditTool` 的验证阶段有重要作用——防止 Claude 基于过期的文件内容进行编辑。
+
+## FileEditTool：精确字符串替换的设计哲学
+
+### 为什么是 old_string/new_string 模式？
+
+这是文件编辑工具设计中最关键的问题。其他方案包括：
+- 行号范围替换（`lines: [10, 20], content: "..."`)
+- Unified Diff 格式（`diff: "@@ -10,5 +10,7 @@..."`)
+- 直接传新文件内容
+
+`old_string/new_string` 模式的优势：
+
+**1. 对 Claude 友好**：Claude 在生成代码时，自然地"读到旧代码，写出新代码"，这与 `old_string/new_string` 的思维模型完美契合。行号模式要求 Claude 精确记住行号，这在长上下文中容易出错。
+
+**2. 防止意外替换**：`old_string` 要求完整匹配。如果 Claude 要替换的代码块在文件中不存在（比如文件被并发修改了），操作会立即失败，而不是静默地写入错误位置。
+
+**3. 自然支持最小化 diff**：工具会展示类似 git diff 的变化，让用户清楚地看到精确修改了什么。
+
+### validateInput()：防止幂等失败
+
+```typescript
+// source/src/tools/FileEditTool/FileEditTool.ts，第 137 行
+async validateInput(input, toolUseContext) {
+  const { file_path, old_string, new_string, replace_all = false } = input
+
+  // 防止无意义的相同内容替换
+  if (old_string === new_string) {
+    return {
+      result: false,
+      message: 'No changes to make: old_string and new_string are identical.',
+      errorCode: 0,
+    }
+  }
+  // ...
+}
+```
+
+更重要的是"过时写入"检测。如果 Claude 读取了文件后，在生成编辑命令之前文件被外部修改了，这次编辑应该失败而不是静默覆盖：
+
+```typescript
+// 检查文件是否在读取后被修改
+const readState = toolUseContext.readFileState.get(fullFilePath)
+if (readState) {
+  const currentTimestamp = getFileModificationTime(fullFilePath)
+  if (currentTimestamp !== readState.timestamp) {
+    return {
+      result: false,
+      message: FILE_UNEXPECTEDLY_MODIFIED_ERROR,
+      errorCode: 2,
+    }
+  }
+}
+```
+
+`FILE_UNEXPECTEDLY_MODIFIED_ERROR` 常量的内容会告知 Claude："文件在读取后被外部修改，请重新读取文件内容再进行编辑"。
+
+### findActualString()：模糊匹配容错
+
+```typescript
+// source/src/tools/FileEditTool/utils.ts（简化）
+export function findActualString(
+  fileContent: string,
+  oldString: string,
+): string | null {
+  // 精确匹配
+  if (fileContent.includes(oldString)) return oldString
+
+  // 忽略行尾空白的模糊匹配
+  const normalizedContent = fileContent.replace(/[ \t]+$/gm, '')
+  const normalizedOld = oldString.replace(/[ \t]+$/gm, '')
+  if (normalizedContent.includes(normalizedOld)) {
+    // 找到对应位置，返回原始文件中的实际字符串
+    // ...
+  }
+
+  return null  // 找不到
+}
+```
+
+这个"容错机制"处理了 Claude 生成的 `old_string` 与文件中实际内容有细微空白差异的情况（常见于不同的编辑器设置）。
+
+## FileWriteTool：完整文件写入
+
+### 输入 Schema 的极简设计
+
+```typescript
+// source/src/tools/FileWriteTool/FileWriteTool.ts，第 56 行
+z.strictObject({
+  file_path: z.string().describe(
+    'The absolute path to the file to write (must be absolute, not relative)',
+  ),
+  content: z.string().describe('The content to write to the file'),
+})
+```
+
+只有两个字段，没有分页、没有模式选项。FileWriteTool 就是"完整替换文件内容"，不多不少。
+
+### create vs update：输出类型区分
+
+```typescript
+// source/src/tools/FileWriteTool/FileWriteTool.ts，第 68 行
+const outputSchema = lazySchema(() =>
+  z.object({
+    type: z.enum(['create', 'update']),  // 新建还是更新
+    filePath: z.string(),
+    content: z.string(),
+    structuredPatch: z.array(hunkSchema()),  // diff 展示
+    originalFile: z.string().nullable(),     // 原始内容（null 表示新文件）
+    gitDiff: gitDiffSchema().optional(),     // Git diff（如果在 git 仓库中）
+  }),
+)
+```
+
+`type` 字段区分"创建新文件"和"覆盖现有文件"，让 UI 可以展示不同的样式（新建用绿色，覆盖用橙色提示）。
+
+### 权限级别：写入比读取严格
+
+```typescript
+// FileWriteTool 的权限检查
+async checkPermissions(input, context) {
+  const appState = context.getAppState()
+  return checkWritePermissionForTool(
+    FileWriteTool,
+    input,
+    appState.toolPermissionContext,
+  )
+}
+```
+
+`checkWritePermissionForTool` 与 `checkReadPermissionForTool` 的区别：
+
+- **读取**：仅检查 deny 规则，默认允许（`isReadOnly = true`）
+- **写入**：先检查 deny 规则，再检查 allow 规则，默认**需要用户确认**（`isReadOnly = false`）
+
+在 `default` 权限模式下，每次 FileWrite 操作都会弹出确认框，显示文件路径和 diff。用户选择"总是允许"后会添加 allow 规则，后续相同路径的写入就不再询问。
+
+## 三者的协作模式
+
+在实际使用中，三个工具经常协同工作：
+
+```
+Read(file.ts)              → 获取文件内容，建立时间戳缓存
+Edit(file.ts, old, new)    → 精确修改特定代码段
+Edit(file.ts, old2, new2)  → 继续修改第二处（基于更新后的状态）
+Write(new_file.ts, ...)    → 创建新的测试文件
+Read(new_file.ts)          → 验证写入结果
+```
+
+这个流程之所以安全，是因为：
+- Read 建立了时间戳基线
+- Edit 在执行前验证时间戳是否变化
+- 多次 Edit 之间的时间戳通过 `readFileState` 缓存自动更新
+
+如果中途文件被外部工具修改，Edit 会立即报错，Claude 知道需要重新 Read 再操作。
+
+<SourceRef file="source/src/tools/FileReadTool/FileReadTool.ts" lines="1-300" />
+<SourceRef file="source/src/tools/FileEditTool/FileEditTool.ts" lines="86-300" />
+<SourceRef file="source/src/tools/FileWriteTool/FileWriteTool.ts" lines="94-200" />
+
+<ArticleComplete />

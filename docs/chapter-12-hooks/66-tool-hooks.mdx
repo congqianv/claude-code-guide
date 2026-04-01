@@ -1,0 +1,432 @@
+---
+sidebar_position: 6
+title: "PreToolUse / PostToolUse：拦截工具执行的完整流程"
+description: 深入解析工具执行前后的 Hook 机制，包括修改工具输入、阻断执行、观察输出的完整实战指南
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# PreToolUse / PostToolUse：拦截工具执行的完整流程
+
+<DifficultyBadge level="深度" />
+
+## 工具 Hook 在执行链中的位置
+
+Claude Code 在每次调用工具时，遵循以下执行链：
+
+```
+Claude 决策：调用 Bash 工具
+  ↓
+[权限检查] checkPermissions() → 需要用户确认？
+  ↓（权限通过后）
+[PreToolUse Hook] executePreToolHooks()
+  ↓（exit 0：继续）
+工具实际执行: bash.call()
+  ↓（执行完成）
+[PostToolUse Hook] executePostToolHooks()
+  ↓
+工具结果返回给 Claude
+```
+
+**关键区别：**
+- PreToolUse 发生在权限检查**通过后**，工具实际执行**之前**
+- PostToolUse 发生在工具**成功执行后**（失败时触发 PostToolUseFailure）
+
+这意味着 PreToolUse 是最后一道防线——即使权限检查通过了，PreToolUse Hook 仍然可以阻止工具执行。
+
+## PreToolUse：工具执行前的拦截点
+
+### executePreToolHooks 函数签名
+
+```typescript
+// source/src/utils/hooks.ts 第 3394 行
+export async function* executePreToolHooks<ToolInput>(
+  toolName: string,        // 工具名称（如 "Bash"）
+  toolUseID: string,       // 工具调用的唯一 ID
+  toolInput: ToolInput,    // 工具的输入参数
+  toolUseContext: ToolUseContext,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs: number = TOOL_HOOK_EXECUTION_TIMEOUT_MS,
+  requestPrompt?,          // 支持 prompt 请求的回调
+  toolInputSummary?,       // 工具输入的摘要（用于 prompt Hook）
+): AsyncGenerator<AggregatedHookResult>
+```
+
+这是一个**异步生成器函数**，允许 Hook 执行过程中流式地产出中间结果（如进度消息）。
+
+### PreToolUse 输入数据结构
+
+```typescript
+type PreToolUseHookInput = {
+  // 基础字段
+  hook_event_name: 'PreToolUse'
+  session_id: string
+  transcript_path: string
+  cwd: string
+  permission_mode?: string
+  agent_id?: string
+  agent_type?: string
+
+  // 工具特定字段
+  tool_name: string
+  tool_input: ToolInput    // 因工具不同而异
+  tool_use_id: string
+}
+```
+
+**常见工具的 `tool_input` 结构：**
+
+```json
+// Bash 工具
+{
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git commit -m 'feat: add feature'",
+    "description": "提交代码变更",
+    "timeout": null
+  }
+}
+
+// Write 工具
+{
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/project/src/index.ts",
+    "content": "const x = 1;\n"
+  }
+}
+
+// Edit 工具
+{
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/project/src/index.ts",
+    "old_string": "const x = 1;",
+    "new_string": "const x = 2;"
+  }
+}
+```
+
+### PreToolUse 能做什么？
+
+PreToolUse Hook 通过 JSON 输出控制工具执行：
+
+#### 1. 阻断工具执行（exit 2）
+
+最直接的用法：以非零状态码退出，stderr 内容会展示给 Claude：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# 阻止危险命令
+if [[ "$COMMAND" =~ (rm -rf|dd if=|mkfs) ]]; then
+  echo "安全策略：禁止执行危险命令: $COMMAND" >&2
+  exit 2  # Claude 会看到这条错误信息
+fi
+```
+
+#### 2. 修改工具输入（updatedInput）
+
+这是 PreToolUse 最强大的功能：在不阻断执行的情况下，修改传递给工具的参数：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# 将所有 npm install 替换为 npm ci（更确定性的安装）
+if [[ "$COMMAND" =~ ^npm install ]]; then
+  NEW_COMMAND="${COMMAND/npm install/npm ci}"
+  cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "updatedInput": {
+      "command": "$NEW_COMMAND"
+    }
+  }
+}
+EOF
+fi
+# exit 0（默认），工具会使用修改后的输入执行
+```
+
+#### 3. 注入额外上下文（additionalContext）
+
+向 Claude 提供额外的上下文信息，影响 Claude 的后续决策：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+if [ -n "$FILE_PATH" ] && [ -f "$FILE_PATH" ]; then
+  # 检查文件的修改历史
+  LAST_MODIFIED=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$FILE_PATH" 2>/dev/null || \
+                  stat -c "%y" "$FILE_PATH" 2>/dev/null | cut -d' ' -f1,2)
+  cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "文件 $FILE_PATH 最后修改时间：$LAST_MODIFIED"
+  }
+}
+EOF
+fi
+```
+
+#### 4. 权限决策（permissionDecision）
+
+直接在 Hook 中做出权限决策，无需等待用户交互：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+# 只读文件：自动允许读取操作
+if [[ "$FILE_PATH" =~ \.lock$ ]]; then
+  cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "permissionDecisionReason": "lock 文件可以安全读取"
+  }
+}
+EOF
+fi
+```
+
+## PostToolUse：工具执行后的观察点
+
+### executePostToolHooks 函数签名
+
+```typescript
+// source/src/utils/hooks.ts 第 3450 行
+export async function* executePostToolHooks<ToolInput, ToolResponse>(
+  toolName: string,
+  toolUseID: string,
+  toolInput: ToolInput,
+  toolResponse: ToolResponse,  // ← 工具执行结果
+  toolUseContext: ToolUseContext,
+  permissionMode?: string,
+  signal?: AbortSignal,
+  timeoutMs: number = TOOL_HOOK_EXECUTION_TIMEOUT_MS,
+): AsyncGenerator<AggregatedHookResult>
+```
+
+PostToolUse 与 PreToolUse 的关键区别：它接收了 `toolResponse` 参数，包含工具实际执行的结果。
+
+### PostToolUse 输入数据结构
+
+```typescript
+type PostToolUseHookInput = {
+  hook_event_name: 'PostToolUse'
+  session_id: string
+  transcript_path: string
+  cwd: string
+  // ... 基础字段
+
+  tool_name: string
+  tool_input: ToolInput
+  tool_response: ToolResponse  // ← 工具结果
+  tool_use_id: string
+}
+```
+
+**Bash 工具的 `tool_response` 结构：**
+
+```json
+{
+  "tool_name": "Bash",
+  "tool_input": { "command": "ls -la" },
+  "tool_response": {
+    "output": "total 48\ndrwxr-xr-x  12 user  staff   384 Jan  1 12:00 .\n...",
+    "exit_code": 0
+  }
+}
+```
+
+### PostToolUse 能做什么？
+
+PostToolUse 主要用于**观察和通知**，而非阻断（虽然技术上 exit 2 也可以向 Claude 发送信息）：
+
+#### 1. 审计日志
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input')
+TOOL_RESPONSE=$(echo "$INPUT" | jq -c '.tool_response')
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id')
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# 写入结构化日志
+jq -cn \
+  --arg ts "$TIMESTAMP" \
+  --arg sid "$SESSION_ID" \
+  --arg tool "$TOOL_NAME" \
+  --arg cwd "$CWD" \
+  --argjson input "$TOOL_INPUT" \
+  --argjson response "$TOOL_RESPONSE" \
+  '{timestamp: $ts, session_id: $sid, tool: $tool, cwd: $cwd, input: $input, response: $response}' \
+  >> /var/log/claude-audit.jsonl
+```
+
+#### 2. 自动触发后处理
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+# 写入 TypeScript 文件后，自动运行类型检查
+if [[ "$TOOL_NAME" == "Write" ]] && [[ "$FILE_PATH" =~ \.tsx?$ ]]; then
+  (cd "$(dirname "$FILE_PATH")" && npx tsc --noEmit 2>&1 | tail -5) || true
+fi
+```
+
+#### 3. 向 Claude 注入上下文（exit 2 + additionalContext）
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+RESPONSE=$(echo "$INPUT" | jq -r '.tool_response.output // empty')
+
+# 如果命令输出包含错误，主动告知 Claude 相关文档
+if echo "$RESPONSE" | grep -q "deprecated"; then
+  cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PostToolUse",
+    "additionalContext": "检测到 deprecated 警告，请参考迁移指南：https://docs.example.com/migration"
+  }
+}
+EOF
+  exit 2  # 立即展示给 Claude
+fi
+```
+
+#### 4. 覆盖 MCP 工具的输出（updatedMCPToolOutput）
+
+对于 MCP 工具，PostToolUse 可以修改返回给 Claude 的输出：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+
+# 过滤 MCP 工具的敏感输出
+if [[ "$TOOL_NAME" == "db_query" ]]; then
+  ORIGINAL_OUTPUT=$(echo "$INPUT" | jq -c '.tool_response')
+  SANITIZED=$(echo "$ORIGINAL_OUTPUT" | sed 's/password":"[^"]*"/password":"***"/g')
+
+  cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PostToolUse",
+    "updatedMCPToolOutput": $SANITIZED
+  }
+}
+EOF
+fi
+```
+
+## PostToolUseFailure：工具执行失败的 Hook
+
+当工具执行失败时，触发 `PostToolUseFailure` 而非 `PostToolUse`：
+
+```typescript
+type PostToolUseFailureHookInput = {
+  hook_event_name: 'PostToolUseFailure'
+  tool_name: string
+  tool_input: ToolInput
+  tool_use_id: string
+  error: string         // 错误消息
+  error_type: string    // 错误类型
+  is_interrupt: boolean // 是否是用户中断
+  is_timeout: boolean   // 是否是超时
+}
+```
+
+使用场景：记录失败日志、发送告警通知、自动尝试恢复。
+
+## 完整实战示例：记录所有 Bash 命令到文件
+
+以下是一个完整的、可直接使用的 Bash 命令审计 Hook：
+
+```bash
+#!/bin/bash
+# 文件：~/.claude/hooks/bash-audit.sh
+# 用途：记录所有 Claude 执行的 Bash 命令
+
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+
+# 只处理 Bash 工具
+if [ "$TOOL_NAME" != "Bash" ]; then
+  exit 0
+fi
+
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id')
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // "N/A"')
+LOG_FILE="$HOME/.claude/bash-audit.log"
+
+# 创建日志目录（如果不存在）
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# 写入日志
+printf "[%s] session=%s cwd=%s cmd=%s\n" \
+  "$TIMESTAMP" "$SESSION_ID" "$CWD" "$COMMAND" >> "$LOG_FILE"
+
+exit 0  # 不阻断，继续执行
+```
+
+对应的 `~/.claude/settings.json` 配置：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/bash-audit.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 小结
+
+PreToolUse 和 PostToolUse 构成了工具执行的"拦截层"：
+
+- **PreToolUse**：最后防线，可以阻断、修改输入、做权限决策、注入上下文
+- **PostToolUse**：观察层，可以审计、触发后处理、向 Claude 注入信息
+- **exit code 语义**：0=继续，2=阻断/通知 Claude，其他=仅通知用户
+- **JSON 输出**：比 exit code 更细粒度的控制，支持修改输入和注入上下文
+
+<SourceRef file="source/src/utils/hooks.ts" lines="3394-3477" />
+
+<ArticleComplete />

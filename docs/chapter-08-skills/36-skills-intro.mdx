@@ -1,0 +1,178 @@
+---
+sidebar_position: 1
+title: Skills 是什么？从用户视角到源码视角
+description: 理解 Claude Code 技能系统的设计理念，从用户的 /skill-name 命令到源码中的 Skill 对象
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Skills 是什么？从用户视角到源码视角
+
+<DifficultyBadge level="入门" />
+
+## 用户视角：斜杠命令背后的技能
+
+当你在 Claude Code 中输入 `/review` 或者 `/commit` 时，你正在调用一个 **Skill（技能）**。
+
+从用户的角度来看，技能就是一类特殊的斜杠命令。它们的特别之处在于：不像 `/help` 这类内置命令直接执行逻辑，技能的本质是一段**预设的、结构化的提示词（prompt）**，这段提示词会被注入到对话上下文中，指导 Claude 按照特定的工作流程来完成任务。
+
+举例来说，假设你有一个 `/pr-review` 技能，它的 Markdown 文件里可能写着：
+
+```markdown
+---
+description: 对当前 PR 进行代码审查
+allowed-tools: Bash, Read
+---
+
+# PR 代码审查
+
+请按照以下步骤审查当前 PR：
+
+1. 运行 `git diff main` 获取变更内容
+2. 分析每个文件的改动逻辑
+3. 检查潜在的 bug 和安全问题
+4. 给出具体的改进建议
+
+{{args}}
+```
+
+用户输入 `/pr-review 请关注性能问题` 后，`{{args}}` 就会被替换成 `请关注性能问题`，整个 Markdown 文本作为提示词注入到对话中，Claude 就会按照这个工作流执行。
+
+## Skills 与普通对话的区别
+
+| 维度 | 普通对话 | Skill 技能 |
+|------|---------|------------|
+| 触发方式 | 直接输入自然语言 | `/skill-name [args]` |
+| 上下文来源 | 用户实时输入 | 预存的 Markdown 文件 |
+| 工具权限 | 继承当前会话 | 可通过 `allowed-tools` 单独声明 |
+| 工作流 | 无固定结构 | 由技能文件定义的标准化流程 |
+| 可复用性 | 每次需要重新描述 | 一次定义，多次调用 |
+| 参数化 | 需要完整描述 | `{{args}}` 占位符 |
+
+简而言之，普通对话适合一次性、临时性的需求；而 Skills 适合那些**重复出现、有固定模式**的工作流——比如代码审查、生成 changelog、格式化文档等。
+
+## Skills 的类型
+
+在 Claude Code v2.1.88 的源码中，技能按加载来源分为以下几种类型：
+
+### 1. 内置技能（Bundled Skills）
+
+随 CLI 二进制文件一起发布的技能，在 `source/src/skills/bundled/` 目录中以 TypeScript 文件形式存在。这些技能在 Claude Code 启动时通过 `initBundledSkills()` 自动注册，例如：
+
+- `/remember` — 内存审查工作流
+- `/verify` — 验证任务执行
+- `/stuck` — 帮助解决卡住的问题
+- `/simplify` — 简化代码或文本
+
+内置技能不需要用户手动创建文件，开箱即用。
+
+### 2. 用户自定义技能（User Skills）
+
+存放在 `~/.claude/skills/` 目录中的技能，只对当前用户生效。这是最常见的自定义方式，你可以为自己的日常工作流创建专属技能。
+
+目录结构规范：
+```
+~/.claude/skills/
+├── pr-review/
+│   └── SKILL.md
+├── commit-msg/
+│   └── SKILL.md
+└── api-design/
+    └── SKILL.md
+```
+
+每个技能必须是一个**子目录**，目录名就是技能名，目录内必须有 `SKILL.md` 文件。
+
+### 3. 项目级技能（Project Skills）
+
+存放在项目根目录的 `.claude/skills/` 目录中。这类技能随项目代码一起提交到版本控制，团队成员都能使用，适合项目特定的工作流。
+
+```
+my-project/
+├── .claude/
+│   └── skills/
+│       ├── deploy/
+│       │   └── SKILL.md
+│       └── changelog/
+│           └── SKILL.md
+└── src/
+```
+
+### 4. MCP 技能（MCP Skills）
+
+通过 MCP（Model Context Protocol）服务器动态提供的技能。MCP 服务器可以暴露特定命名格式的工具，Claude Code 会将这些工具自动转换为可调用的技能。这类技能无需本地文件，从远程服务器动态获取。
+
+### 5. 插件技能（Plugin Skills）
+
+通过插件系统加载的技能，来自 `loadedFrom: 'plugin'`，由插件的 manifest 定义。
+
+在源码的 `LoadedFrom` 类型中，这五种来源被明确枚举：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts
+export type LoadedFrom =
+  | 'commands_DEPRECATED'  // 旧版 /commands/ 目录（已废弃）
+  | 'skills'               // 新版 /skills/ 目录
+  | 'plugin'               // 插件提供
+  | 'managed'              // 管理员策略
+  | 'bundled'              // 内置
+  | 'mcp'                  // MCP 服务器
+```
+
+## 技能文件的基本结构
+
+一个标准的技能文件（`SKILL.md`）由两部分组成：
+
+**YAML Front Matter**（配置元数据）+ **Markdown Body**（提示词正文）
+
+```markdown
+---
+description: 生成规范的 Git 提交信息
+allowed-tools: Bash, Read
+argument-hint: "[可选] 额外的提交信息说明"
+when_to_use: 当你需要提交代码时使用此技能
+model: claude-opus-4-5
+---
+
+# 生成 Git 提交信息
+
+请分析当前的 `git diff --staged` 输出，然后：
+
+1. 理解每个变更的目的
+2. 生成符合 Conventional Commits 规范的提交信息
+3. 格式：`<type>(<scope>): <description>`
+
+用户附加说明：{{args}}
+```
+
+**Front Matter 字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `description` | string | 技能的简短描述，显示在命令列表中 |
+| `allowed-tools` | string | 允许使用的工具列表（逗号分隔） |
+| `argument-hint` | string | 参数提示，显示在自动补全中 |
+| `when_to_use` | string | 告知 Claude 何时应该推荐此技能 |
+| `model` | string | 指定使用的模型（可选） |
+| `user-invocable` | boolean | 是否允许用户直接调用（默认 `true`） |
+| `context` | `inline`\|`fork` | 执行上下文：内联或创建子代理 |
+
+## 为什么需要 Skills？
+
+Skills 系统解决了几个实际问题：
+
+**1. 减少重复描述**：对于固定的工作流，你不需要每次都详细描述步骤，一次定义，之后只需 `/skill-name` 即可调用。
+
+**2. 标准化团队工作流**：项目级技能允许团队将代码审查、部署检查、文档生成等流程标准化，确保每个人使用相同的步骤。
+
+**3. 参数化复用**：通过 `{{args}}` 占位符，同一个技能可以接受不同的参数，在保持流程一致的同时支持定制化。
+
+**4. 工具权限隔离**：每个技能可以独立声明所需工具，不必给所有对话开放所有权限，更加安全。
+
+**5. 可组合性**：技能可以在内部引用其他 Claude Code 工具，配合 `allowed-tools` 精确控制可用能力。
+
+<SourceRef file="source/src/skills/loadSkillsDir.ts" lines="67-94" />
+
+<ArticleComplete />

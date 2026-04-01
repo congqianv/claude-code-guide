@@ -1,0 +1,344 @@
+---
+sidebar_position: 2
+title: loadSkillsDir.ts：技能如何被发现与加载
+description: 深入解析 loadSkillsDir.ts 的 1086 行代码，理解技能扫描、解析、去重和条件激活的完整流程
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# loadSkillsDir.ts：技能如何被发现与加载
+
+<DifficultyBadge level="深度" />
+
+`loadSkillsDir.ts` 是 Skills 系统的核心加载器，共 1086 行。它负责从多个目录扫描技能文件、解析 YAML front matter、组装 `Command` 对象，并处理去重、条件激活等复杂逻辑。
+
+## 技能加载的入口：getSkillDirCommands
+
+整个技能目录加载的主函数是 `getSkillDirCommands`，它被 `memoize` 包装，以 `cwd`（当前工作目录）为缓存键：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 638 行
+export const getSkillDirCommands = memoize(
+  async (cwd: string): Promise<Command[]> => {
+    const userSkillsDir = join(getClaudeConfigHomeDir(), 'skills')
+    const managedSkillsDir = join(getManagedFilePath(), '.claude', 'skills')
+    const projectSkillsDirs = getProjectDirsUpToHome('skills', cwd)
+
+    // 并行加载所有来源
+    const [
+      managedSkills,
+      userSkills,
+      projectSkillsNested,
+      additionalSkillsNested,
+      legacyCommands,
+    ] = await Promise.all([...])
+
+    // 去重、条件过滤、返回
+    return unconditionalSkills
+  },
+)
+```
+
+**四个加载来源**（按优先级从高到低）：
+
+1. **managedSkills** — 管理员策略目录（`CLAUDE_CODE_DISABLE_POLICY_SKILLS` 环境变量可禁用）
+2. **userSkills** — 用户主目录 `~/.claude/skills/`
+3. **projectSkillsDirs** — 从项目目录向上遍历到 `$HOME` 的所有 `.claude/skills/` 目录
+4. **legacyCommands** — 旧版 `.claude/commands/` 目录（已废弃但仍支持）
+
+这四组加载任务通过 `Promise.all` **并行**执行，充分利用 I/O 并发性。
+
+## loadSkillsFromSkillsDir：新版目录格式
+
+新版技能只支持一种格式：**目录 + SKILL.md 文件**。
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 407-480 行
+async function loadSkillsFromSkillsDir(
+  basePath: string,
+  source: SettingSource,
+): Promise<SkillWithPath[]> {
+  const entries = await fs.readdir(basePath)
+
+  const results = await Promise.all(
+    entries.map(async (entry): Promise<SkillWithPath | null> => {
+      // 只处理目录（不支持单个 .md 文件）
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+        return null  // 单个 .md 文件直接跳过
+      }
+
+      const skillDirPath = join(basePath, entry.name)
+      const skillFilePath = join(skillDirPath, 'SKILL.md')
+
+      // 读取 SKILL.md 内容
+      const content = await fs.readFile(skillFilePath, { encoding: 'utf-8' })
+
+      // 解析 front matter
+      const { frontmatter, content: markdownContent } = parseFrontmatter(
+        content,
+        skillFilePath,
+      )
+
+      // 目录名 = 技能名
+      const skillName = entry.name
+
+      const parsed = parseSkillFrontmatterFields(frontmatter, markdownContent, skillName)
+      const paths = parseSkillPaths(frontmatter)
+
+      return {
+        skill: createSkillCommand({
+          ...parsed,
+          skillName,
+          markdownContent,
+          source,
+          baseDir: skillDirPath,  // 技能根目录
+          loadedFrom: 'skills',
+          paths,
+        }),
+        filePath: skillFilePath,
+      }
+    }),
+  )
+
+  return results.filter((r): r is SkillWithPath => r !== null)
+}
+```
+
+**关键设计**：
+- 目录名直接作为技能名（`entry.name`）
+- `SKILL.md` 不存在时静默跳过（只有非 ENOENT 错误才记录日志）
+- `baseDir` 被记录为技能根目录，用于后续的 `${CLAUDE_SKILL_DIR}` 变量替换
+
+## parseSkillFrontmatterFields：front matter 解析
+
+这是所有技能（包括 MCP 技能）共用的 front matter 解析函数：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 185-265 行
+export function parseSkillFrontmatterFields(
+  frontmatter: FrontmatterData,
+  markdownContent: string,
+  resolvedName: string,
+  descriptionFallbackLabel: 'Skill' | 'Custom command' = 'Skill',
+) {
+  // description：优先用 front matter，否则从 Markdown 正文提取第一段
+  const validatedDescription = coerceDescriptionToString(
+    frontmatter.description,
+    resolvedName,
+  )
+  const description =
+    validatedDescription ??
+    extractDescriptionFromMarkdown(markdownContent, descriptionFallbackLabel)
+
+  // user-invocable：控制用户能否用 /skill-name 调用
+  const userInvocable =
+    frontmatter['user-invocable'] === undefined
+      ? true
+      : parseBooleanFrontmatter(frontmatter['user-invocable'])
+
+  // model：解析并验证模型名（'inherit' 代表继承当前会话模型）
+  const model =
+    frontmatter.model === 'inherit'
+      ? undefined
+      : frontmatter.model
+        ? parseUserSpecifiedModel(frontmatter.model as string)
+        : undefined
+
+  // effort：解析 effort 级别（low/medium/high/max 或整数）
+  const effort = effortRaw !== undefined ? parseEffortValue(effortRaw) : undefined
+
+  return {
+    description,
+    hasUserSpecifiedDescription: validatedDescription !== null,
+    allowedTools: parseSlashCommandToolsFromFrontmatter(frontmatter['allowed-tools']),
+    argumentHint: frontmatter['argument-hint'],
+    argumentNames: parseArgumentNames(frontmatter.arguments),
+    whenToUse: frontmatter.when_to_use,
+    model,
+    disableModelInvocation,
+    userInvocable,
+    hooks: parseHooksFromFrontmatter(frontmatter, resolvedName),
+    executionContext: frontmatter.context === 'fork' ? 'fork' : undefined,
+    agent: frontmatter.agent,
+    effort,
+    shell: parseShellFrontmatter(frontmatter.shell, resolvedName),
+  }
+}
+```
+
+**description 的双重来源**：如果 front matter 里没有 `description` 字段，系统会自动从 Markdown 正文提取——通常是第一个段落的文本。这意味着即使不写 `description` 字段，技能也会有一个可读的描述。
+
+## 技能名称的生成规则
+
+技能名通过两个辅助函数生成，对应新版目录格式和旧版命令格式：
+
+### 新版 /skills/ 目录
+
+目录名直接就是技能名：
+```
+~/.claude/skills/pr-review/SKILL.md  →  pr-review
+~/.claude/skills/api-design/SKILL.md  →  api-design
+```
+
+### 嵌套目录的命名空间
+
+如果技能目录存在层级嵌套，父目录名会成为命名空间，用 `:` 分隔：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 523-543 行
+function buildNamespace(targetDir: string, baseDir: string): string {
+  if (targetDir === normalizedBaseDir) {
+    return ''
+  }
+  const relativePath = targetDir.slice(normalizedBaseDir.length + 1)
+  return relativePath ? relativePath.split(pathSep).join(':') : ''
+}
+
+// 示例：
+// baseDir: ~/.claude/skills
+// skillDir: ~/.claude/skills/frontend/lint/SKILL.md
+// 技能名: frontend:lint
+```
+
+这种命名空间机制允许你组织多层技能，避免命名冲突：
+
+```
+~/.claude/skills/
+├── frontend/
+│   ├── lint/SKILL.md      →  frontend:lint
+│   └── review/SKILL.md    →  frontend:review
+└── backend/
+    ├── test/SKILL.md       →  backend:test
+    └── deploy/SKILL.md     →  backend:deploy
+```
+
+## 基于 realpath 的去重机制
+
+当用户设置了 `--add-dir` 或存在符号链接时，同一个技能文件可能被多个路径发现。`getSkillDirCommands` 使用 `realpath` 解析符号链接后的真实路径来去重：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 726-763 行
+
+// 并行解析所有文件的真实路径
+const fileIds = await Promise.all(
+  allSkillsWithPaths.map(({ filePath }) =>
+    getFileIdentity(filePath)  // 内部调用 realpath()
+  ),
+)
+
+const seenFileIds = new Map<string, SettingSource>()
+const deduplicatedSkills: Command[] = []
+
+for (let i = 0; i < allSkillsWithPaths.length; i++) {
+  const { skill } = allSkillsWithPaths[i]
+  const fileId = fileIds[i]
+
+  if (seenFileIds.has(fileId)) {
+    logForDebugging(`Skipping duplicate skill '${skill.name}'...`)
+    continue  // 跳过重复
+  }
+
+  seenFileIds.set(fileId, skill.source)
+  deduplicatedSkills.push(skill)
+}
+```
+
+**为什么用 realpath 而不是 inode？** 注释中明确说明：某些虚拟文件系统（如 NFS、ExFAT）会报告不可靠的 inode 值（例如全是 0），用 realpath 更可靠。
+
+## 条件技能（paths frontmatter）
+
+这是一个高级特性：技能可以声明它只在特定文件被访问时激活。
+
+```yaml
+---
+description: 优化 React 组件性能
+paths:
+  - src/components/**
+  - "**/*.tsx"
+---
+```
+
+加载时，有 `paths` 字段的技能不会立即进入可用技能列表，而是被存入 `conditionalSkills` Map：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 771-796 行
+const unconditionalSkills: Command[] = []
+const newConditionalSkills: Command[] = []
+
+for (const skill of deduplicatedSkills) {
+  if (skill.paths && skill.paths.length > 0) {
+    newConditionalSkills.push(skill)  // 暂存
+  } else {
+    unconditionalSkills.push(skill)   // 立即可用
+  }
+}
+
+// 条件技能存入 Map，等待文件操作触发激活
+for (const skill of newConditionalSkills) {
+  conditionalSkills.set(skill.name, skill)
+}
+
+return unconditionalSkills  // 只返回无条件技能
+```
+
+当模型执行文件操作（Read、Write、Edit）时，`activateConditionalSkillsForPaths` 会被调用，检查操作的文件路径是否匹配某个条件技能的 `paths` 模式。一旦匹配，该技能就从 `conditionalSkills` 移入 `dynamicSkills`，变为可用。
+
+## 动态技能发现
+
+在会话进行中，当模型访问嵌套子目录时，Claude Code 会检查这些子目录是否有 `.claude/skills/`：
+
+```typescript
+// source/src/skills/loadSkillsDir.ts，第 861-914 行
+export async function discoverSkillDirsForPaths(
+  filePaths: string[],
+  cwd: string,
+): Promise<string[]> {
+  for (const filePath of filePaths) {
+    let currentDir = dirname(filePath)
+
+    // 从文件路径向上遍历，直到 cwd（不含 cwd 本身）
+    while (currentDir.startsWith(resolvedCwd + pathSep)) {
+      const skillDir = join(currentDir, '.claude', 'skills')
+
+      if (!dynamicSkillDirs.has(skillDir)) {
+        dynamicSkillDirs.add(skillDir)  // 记录已检查，避免重复
+
+        // 跳过 gitignored 目录（防止 node_modules 里的技能被加载）
+        if (await isPathGitignored(currentDir, resolvedCwd)) {
+          continue
+        }
+
+        // 目录存在就加入发现列表
+        await fs.stat(skillDir)
+        newDirs.push(skillDir)
+      }
+
+      currentDir = dirname(currentDir)
+    }
+  }
+
+  // 深度优先排序：深层目录优先（优先级更高）
+  return newDirs.sort(
+    (a, b) => b.split(pathSep).length - a.split(pathSep).length,
+  )
+}
+```
+
+**安全考虑**：在遍历时会调用 `isPathGitignored()` 检查目录是否被 gitignore。这是为了防止 `node_modules/some-package/.claude/skills/` 这类路径中的恶意技能被自动加载。
+
+## 错误处理策略
+
+`loadSkillsDir.ts` 的错误处理遵循**容错优先**原则：
+
+- **目录不存在（ENOENT）**：静默返回空数组，不报错（技能目录是可选的）
+- **无法访问（EACCES/EPERM）**：记录错误日志，但继续加载其他技能
+- **SKILL.md 解析失败**：`try/catch` 捕获单个技能的错误，跳过该技能，不影响其他技能
+- **hooks 格式无效**：通过 Zod schema 验证，无效时返回 `undefined`（跳过 hooks 注册）
+
+这种策略确保了即使某个技能文件格式错误，也不会导致整个技能系统崩溃。
+
+<SourceRef file="source/src/skills/loadSkillsDir.ts" lines="407-480" />
+
+<ArticleComplete />

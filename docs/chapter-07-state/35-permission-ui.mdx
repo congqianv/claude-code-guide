@@ -1,0 +1,373 @@
+---
+sidebar_position: 5
+title: 交互组件：权限提示 UI 的实现
+description: 深入解析 Claude Code 权限提示 UI 的完整实现——从触发时机、组件层次、键盘交互，到决策如何反馈给 query 循环
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 交互组件：权限提示 UI 的实现
+
+<DifficultyBadge level="深度" />
+
+当 Claude Code 准备执行 `bash` 命令或修改文件时，会暂停 AI 循环，向用户显示一个权限提示框。这个看似简单的 UI 交互，背后连接着权限决策系统、键盘事件处理、query 循环暂停与恢复——是 Claude Code 中最精密的交互设计之一。
+
+## 触发时机：从 query 循环到 UI
+
+权限提示的触发链路如下：
+
+```
+query.ts: runTools()
+  → tool.checkPermissions()  // 工具自身的权限预检查
+    → useCanUseTool()  // 主权限决策 hook
+      → hasPermissionsToUseTool()  // 规则匹配
+        → result.behavior === "ask"  // 需要用户确认
+          → handleInteractivePermission()  // 显示 UI
+            → setToolUseConfirmQueue()  // 将 confirm 回调推入队列
+              → UI 组件渲染权限提示
+                → 用户选择
+                  → resolve(decision)  // Promise 决议
+                    → query 循环继续
+```
+
+关键机制是一个 **Promise**：`useCanUseTool` 返回一个 `Promise<PermissionDecision>`，query 循环 `await` 这个 Promise。只要用户没有做出选择，query 循环就一直等待——不会超时，不会取消，就是等着。
+
+### useCanUseTool：权限决策的 React hook
+
+```typescript
+// source/src/hooks/useCanUseTool.tsx（简化）
+function useCanUseTool(setToolUseConfirmQueue, setToolPermissionContext) {
+  return async (tool, input, toolUseContext, assistantMessage, toolUseID) => {
+    return new Promise(resolve => {
+      const ctx = createPermissionContext(tool, input, toolUseContext, ...);
+
+      // 首先检查规则匹配（不需要 UI）
+      const decisionPromise = hasPermissionsToUseTool(tool, input, ...);
+
+      decisionPromise.then(async result => {
+        if (result.behavior === "allow") {
+          // 规则匹配允许：直接 resolve，不显示 UI
+          resolve(ctx.buildAllow(input));
+          return;
+        }
+        if (result.behavior === "deny") {
+          // 规则匹配拒绝：直接 resolve，不显示 UI
+          resolve(result);
+          return;
+        }
+        if (result.behavior === "ask") {
+          // 需要用户确认：将 confirm 回调推入队列
+          await handleInteractivePermission({
+            ctx,
+            description,
+            suggestions: result.suggestions,
+          });
+          // handleInteractivePermission 内部会调用 resolve()
+        }
+      });
+    });
+  };
+}
+```
+
+### 工具级权限分发：permissionComponentForTool
+
+每种工具有专属的权限请求组件，由 `PermissionRequest.tsx` 中的 `permissionComponentForTool` 函数分发：
+
+```typescript
+// source/src/components/permissions/PermissionRequest.tsx
+function permissionComponentForTool(tool: Tool): React.ComponentType<PermissionRequestProps> {
+  switch (tool) {
+    case FileEditTool:    return FileEditPermissionRequest;
+    case FileWriteTool:  return FileWritePermissionRequest;
+    case BashTool:       return BashPermissionRequest;
+    case WebFetchTool:   return WebFetchPermissionRequest;
+    case GlobTool:
+    case GrepTool:
+    case FileReadTool:   return FilesystemPermissionRequest;
+    default:             return FallbackPermissionRequest;
+  }
+}
+```
+
+这种设计让每个工具完全控制自己的权限提示内容，而共享相同的框架（`PermissionDialog` + `PermissionPrompt`）。
+
+## 权限提示的组件层次
+
+```
+PermissionRequest (工具路由)
+  └── BashPermissionRequest / FileEditPermissionRequest / ...
+        └── PermissionDialog (视觉框架)
+              ├── PermissionRequestTitle (标题栏)
+              └── PermissionPrompt (选项交互)
+                    └── Select (键盘导航选择器)
+```
+
+### PermissionDialog：视觉容器
+
+```tsx
+// source/src/components/permissions/PermissionDialog.tsx
+export function PermissionDialog({ title, subtitle, children }) {
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="permission"  // 使用主题的权限色（通常是黄色）
+      // 只显示顶部边框，形成"附加到上方内容"的视觉效果
+      borderLeft={false}
+      borderRight={false}
+      borderBottom={false}
+      marginTop={1}
+    >
+      <Box paddingX={1} flexDirection="column">
+        <Box justifyContent="space-between">
+          <PermissionRequestTitle title={title} subtitle={subtitle} />
+        </Box>
+      </Box>
+      <Box flexDirection="column" paddingX={1}>
+        {children}
+      </Box>
+    </Box>
+  );
+}
+```
+
+渲染效果：
+
+```
+╭─────────────────────────────────────────
+│ BashTool · Run command
+│
+│  $ npm test -- --watch
+│
+│ > Yes, allow once
+│   Yes, allow in this session
+│   No, don't allow
+│
+│ Esc to cancel · Tab to amend
+```
+
+只有顶部的圆角边框，没有底部和侧边框，让提示框视觉上像是"附着"在当前对话流上方，而不是一个独立的弹窗。
+
+### PermissionPrompt：选项与交互
+
+```tsx
+// source/src/components/permissions/PermissionPrompt.tsx（简化）
+export function PermissionPrompt<T extends string>({
+  options,        // 选项列表（值 + 标签 + 可选 feedbackConfig）
+  onSelect,       // 用户选择后的回调
+  onCancel,       // 用户按 Esc 后的回调
+  question = "Do you want to proceed?",
+}) {
+  const [acceptFeedback, setAcceptFeedback] = useState("");
+  const [rejectFeedback, setRejectFeedback] = useState("");
+  const [acceptInputMode, setAcceptInputMode] = useState(false);
+
+  // Tab 键切换到"附加说明"输入模式
+  const handleInputModeToggle = useCallback((value: T) => {
+    const option = options.find(opt => opt.value === value);
+    if (option?.feedbackConfig?.type === "accept") {
+      setAcceptInputMode(prev => !prev);
+    }
+  }, [options, acceptInputMode]);
+
+  // 选择时附带用户输入的 feedback
+  const handleSelect = useCallback((value: T) => {
+    const option = options.find(opt => opt.value === value);
+    const feedback = option?.feedbackConfig
+      ? acceptFeedback.trim() || rejectFeedback.trim() || undefined
+      : undefined;
+    onSelect(value, feedback);
+  }, [options, acceptFeedback, rejectFeedback, onSelect]);
+
+  return (
+    <Box flexDirection="column">
+      <Text>{question}</Text>
+      <Select
+        options={selectOptions}
+        onChange={handleSelect}
+        onCancel={handleCancel}
+        onInputModeToggle={handleInputModeToggle}
+      />
+      <Box marginTop={1}>
+        <Text dimColor>Esc to cancel{showTabHint && " · Tab to amend"}</Text>
+      </Box>
+    </Box>
+  );
+}
+```
+
+**Tab 附加说明**是一个精妙的 UX 设计：当用户选中"Yes"时，可以按 Tab 键展开一个文本输入框，输入"接下来做什么"的补充说明（`feedback`）。这个 `feedback` 会作为下一轮的用户消息注入，引导 Claude 的后续行为。
+
+## 键盘处理：useKeybindings
+
+权限提示期间，需要拦截全局键盘事件，防止用户误操作：
+
+```typescript
+// 注册带 context 的键盘绑定
+// context 参数决定优先级和激活条件
+useKeybindings(keybindingHandlers, { context: "Confirmation" });
+```
+
+`Confirmation` context 的键绑定优先级高于普通的全局快捷键，确保权限提示期间：
+- 方向键控制选项焦点
+- Enter 键确认当前选项
+- Esc 键取消（并调用 `onCancel`）
+- `y` / `n` 等热键直接触发对应选项
+
+Esc 取消时还会递增 `AppState.attribution.escapeCount`，用于统计用户的拒绝行为：
+
+```typescript
+const handleCancel = useCallback(() => {
+  logEvent("tengu_permission_request_escape", {});
+  setAppState(prev => ({
+    ...prev,
+    attribution: {
+      ...prev.attribution,
+      escapeCount: prev.attribution.escapeCount + 1,  // 统计 Esc 次数
+    },
+  }));
+  onCancel?.();
+}, [onCancel, setAppState]);
+```
+
+## BashPermissionRequest：最复杂的权限提示
+
+Bash 命令的权限提示是所有权限提示中最复杂的，包含多种高级功能：
+
+### 命令展示与危险性警告
+
+```typescript
+// 检测命令是否具有破坏性（如 rm -rf）
+const destructiveWarning = getDestructiveCommandWarning(command);
+```
+
+危险命令会显示红色警告文字，让用户特别注意。
+
+### 自动化分类器集成
+
+当启用 `BASH_CLASSIFIER` 特性时，权限请求会先等待一个 AI 分类器异步判断命令是否安全。在等待期间显示 shimmer 加载动画：
+
+```typescript
+// 将 shimmer 动画提取为独立组件，隔离 50ms 重渲染
+function ClassifierCheckingSubtitle() {
+  const [ref, glimmerIndex] = useShimmerAnimation("requesting", CHECKING_TEXT, false);
+  return (
+    <Box ref={ref}>
+      <Text>
+        {[...CHECKING_TEXT].map((char, i) => (
+          <ShimmerChar key={i} char={char} index={i} glimmerIndex={glimmerIndex} />
+        ))}
+      </Text>
+    </Box>
+  );
+}
+```
+
+这是一个性能优化的典范：shimmer 动画每 50ms 更新一次，如果放在主组件里会导致整个权限对话框以 20fps 重渲染。通过提取为子组件，只有这个子组件以高频率重渲染，父组件保持稳定。
+
+### 选项结构
+
+Bash 权限提示的选项通常包含三项：
+
+```typescript
+const options: PermissionPromptOption<BashDecision>[] = [
+  {
+    value: "yes",
+    label: <Text color="success">Yes, allow once</Text>,
+    feedbackConfig: {
+      type: "accept",
+      placeholder: "tell Claude what to do next",  // Tab 后显示的输入框提示
+    },
+    keybinding: "confirmToolUse",  // 可通过快捷键直接触发
+  },
+  {
+    value: "yes-always",
+    label: <Text>Yes, allow in this session</Text>,
+    keybinding: "confirmAllToolUse",
+  },
+  {
+    value: "no",
+    label: <Text color="error">No, don't allow</Text>,
+    feedbackConfig: {
+      type: "reject",
+      placeholder: "tell Claude what to do differently",
+    },
+    keybinding: "rejectToolUse",
+  },
+];
+```
+
+## 权限决策反馈给 query 循环
+
+当用户做出选择后，决策通过 Promise resolve 传回 query 循环：
+
+```typescript
+// 用户选择 "Yes"
+onSelect("yes", feedback) {
+  // resolve() 被调用，query 循环继续执行工具
+  resolve({
+    behavior: "allow",
+    updatedInput: input,
+    decisionReason: {
+      type: "interactive",
+      decision: "accept",
+      feedback,  // 如果用户输入了说明，附加到下一轮消息
+    }
+  });
+}
+
+// 用户选择 "Yes, allow in session"
+onSelect("yes-always") {
+  // 同时更新 AppState，添加会话级别的 allow 规则
+  setAppState(prev => addSessionAllowRule(prev, tool, input));
+  resolve({ behavior: "allow", ... });
+}
+
+// 用户选择 "No"
+onSelect("no", feedback) {
+  resolve({
+    behavior: "deny",
+    decisionReason: {
+      type: "interactive",
+      decision: "reject",
+      feedback,  // 反馈给 Claude，解释为什么拒绝
+    }
+  });
+}
+```
+
+`feedback` 字段是一个关键设计：无论是"Yes + 说明"还是"No + 说明"，用户的补充文字都会被注入到对话流中，作为下一条 user 消息。这让用户不仅能批准/拒绝，还能同时引导 Claude 的后续行为。
+
+## 终端 UI 设计思考
+
+权限提示 UI 的设计体现了几个终端界面的设计原则：
+
+**1. 最小化干扰**：只有顶部边框，不遮挡已有内容。用户可以上下滚动查看此前的对话。
+
+**2. 键盘优先**：所有操作都可以通过键盘完成，并且有快捷键。鼠标只是辅助。
+
+**3. 即时反馈**：自动化分类器检查时，shimmer 动画告诉用户"系统正在工作"，不是卡住了。
+
+**4. 渐进式选项**：三个选项的粒度（一次 / 本会话 / 拒绝）让用户按需选择信任级别，而不是非 0 即 1。
+
+**5. 可撤销的 Esc**：Esc 取消后，query 循环收到 `AbortError`，Claude 会收到"用户取消了"的通知，而不是静默失败。
+
+## 小结
+
+权限提示 UI 是终端交互设计的精华展示：
+
+- **组件层次清晰**：`PermissionRequest` 路由 → 工具专属组件 → `PermissionDialog` 容器 → `PermissionPrompt` 交互
+- **Promise 桥接**：React 事件系统与 query 循环之间通过 Promise 优雅衔接
+- **性能考量**：shimmer 动画提取为子组件，避免高频重渲染污染整个对话框
+- **UX 细节**：Tab 附加说明、危险命令警告、Esc 计数统计
+
+这个设计让用户在做权限决策时既能快速操作（热键），又能深度参与（Tab 说明），体现了 Claude Code 对用户体验的细致打磨。
+
+<SourceRef file="source/src/components/permissions/PermissionPrompt.tsx" lines="1-336" />
+<SourceRef file="source/src/components/permissions/PermissionRequest.tsx" lines="47-80" />
+<SourceRef file="source/src/hooks/useCanUseTool.tsx" lines="28-160" />
+
+<ArticleComplete />

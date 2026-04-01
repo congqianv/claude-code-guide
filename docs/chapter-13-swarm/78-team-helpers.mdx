@@ -1,0 +1,325 @@
+---
+sidebar_position: 8
+title: teamHelpers.ts：团队协作工具函数集
+description: 深入解析 683 行的 teamHelpers.ts，掌握团队配置文件管理、成员注册与路径权限等核心工具函数
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# teamHelpers.ts：团队协作工具函数集
+
+<DifficultyBadge level="进阶" />
+
+## 文件定位
+
+`teamHelpers.ts`（683 行）是 Swarm 系统的**基础设施层**，提供所有与团队配置文件操作相关的工具函数。上层模块（`teamDiscovery.ts`、`permissionSync.ts`、`inProcessRunner.ts` 等）都依赖它。
+
+这个文件没有"算法"，但有大量的**状态管理逻辑**：团队成员的增删改查、路径权限管理、成员状态更新等。
+
+## 核心数据模型：TeamFile
+
+```typescript
+export type TeamFile = {
+  name: string                         // 团队名称
+  description?: string                 // 团队描述
+  createdAt: number                    // 创建时间戳
+  leadAgentId: string                  // Leader 的 agentId
+  leadSessionId?: string               // Leader 的 session UUID（用于发现）
+  hiddenPaneIds?: string[]             // 被隐藏的面板 ID 列表
+  teamAllowedPaths?: TeamAllowedPath[] // 团队级别的权限路径
+  members: Array<{
+    agentId: string         // "name@team"
+    name: string            // 简短名称
+    agentType?: string      // 角色类型
+    model?: string          // 使用的模型
+    prompt?: string         // 初始任务提示词
+    color?: string          // UI 颜色
+    planModeRequired?: boolean  // 是否需要 plan mode
+    joinedAt: number        // 加入时间戳
+    tmuxPaneId: string      // tmux 面板 ID 或虚拟 ID
+    cwd: string             // 工作目录
+    worktreePath?: string   // git worktree 路径
+    sessionId?: string      // 实际 session UUID
+    subscriptions: string[] // 订阅的事件类型
+    backendType?: BackendType  // 执行后端类型
+    isActive?: boolean      // false = idle，undefined/true = running
+    mode?: PermissionMode   // 当前权限模式
+  }>
+}
+```
+
+## 路径与文件操作基础
+
+### 名称清理
+
+```typescript
+// 用于 tmux 窗口名、worktree 路径、文件路径：
+// 将所有非字母数字字符替换为 "-"，转为小写
+export function sanitizeName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()
+}
+
+// 用于 agentId 格式（agentName@teamName）：
+// 只替换 @ 字符，防止格式歧义
+export function sanitizeAgentName(name: string): string {
+  return name.replace(/@/g, '-')
+}
+```
+
+### 路径计算
+
+```typescript
+export function getTeamDir(teamName: string): string {
+  return join(getTeamsDir(), sanitizeName(teamName))
+  // ~/ .claude/teams/{sanitized-name}/
+}
+
+export function getTeamFilePath(teamName: string): string {
+  return join(getTeamDir(teamName), 'config.json')
+}
+```
+
+### 读写文件（Sync + Async 双套 API）
+
+```typescript
+// 同步读（React render 路径使用）
+export function readTeamFile(teamName: string): TeamFile | null {
+  try {
+    return jsonParse(readFileSync(getTeamFilePath(teamName), 'utf-8')) as TeamFile
+  } catch (e) {
+    if (getErrnoCode(e) === 'ENOENT') return null
+    return null  // 损坏文件也返回 null
+  }
+}
+
+// 异步读（工具处理器使用）
+export async function readTeamFileAsync(teamName: string): Promise<TeamFile | null>
+
+// 同步写（React render 路径使用）
+function writeTeamFile(teamName: string, teamFile: TeamFile): void {
+  const teamDir = getTeamDir(teamName)
+  mkdirSync(teamDir, { recursive: true })
+  writeFileSync(getTeamFilePath(teamName), jsonStringify(teamFile, null, 2))
+}
+
+// 异步写（工具处理器使用）
+export async function writeTeamFileAsync(teamName: string, teamFile: TeamFile): Promise<void>
+```
+
+## 成员管理函数
+
+### removeTeammateFromTeamFile() — 按 agentId 或 name 移除
+
+```typescript
+export function removeTeammateFromTeamFile(
+  teamName: string,
+  identifier: { agentId?: string; name?: string },
+): boolean {
+  const teamFile = readTeamFile(teamName)
+  if (!teamFile) return false
+
+  const originalLength = teamFile.members.length
+  teamFile.members = teamFile.members.filter(m => {
+    if (identifier.agentId && m.agentId === identifier.agentId) return false
+    if (identifier.name && m.name === identifier.name) return false
+    return true
+  })
+
+  if (teamFile.members.length === originalLength) return false  // 没找到
+
+  writeTeamFile(teamName, teamFile)
+  return true
+}
+```
+
+### removeMemberFromTeam() — 按 tmuxPaneId 移除
+
+```typescript
+export function removeMemberFromTeam(teamName: string, tmuxPaneId: string): boolean {
+  const teamFile = readTeamFile(teamName)
+  if (!teamFile) return false
+
+  const memberIndex = teamFile.members.findIndex(m => m.tmuxPaneId === tmuxPaneId)
+  if (memberIndex === -1) return false
+
+  teamFile.members.splice(memberIndex, 1)
+
+  // 同时从 hiddenPaneIds 移除
+  if (teamFile.hiddenPaneIds) {
+    const hiddenIndex = teamFile.hiddenPaneIds.indexOf(tmuxPaneId)
+    if (hiddenIndex !== -1) {
+      teamFile.hiddenPaneIds.splice(hiddenIndex, 1)
+    }
+  }
+
+  writeTeamFile(teamName, teamFile)
+  return true
+}
+```
+
+### removeMemberByAgentId() — 从 AppState 移除（in-process 专用）
+
+```typescript
+export function removeMemberByAgentId(
+  agentId: string,
+  teamName: string,
+  setAppState: SetAppStateFn,
+): void {
+  // 1. 从团队文件中移除
+  removeTeammateFromTeamFile(teamName, { agentId })
+
+  // 2. 从 AppState 中移除（触发 UI 更新）
+  setAppState(prev => ({
+    ...prev,
+    tasks: Object.fromEntries(
+      Object.entries(prev.tasks).filter(([_, task]) => {
+        if (task.type !== 'in_process_teammate') return true
+        return task.identity.agentId !== agentId
+      })
+    )
+  }))
+}
+```
+
+## 面板隐藏管理
+
+```typescript
+// 隐藏面板（从视图中移除但保持运行）
+export function addHiddenPaneId(teamName: string, paneId: string): boolean
+
+// 重新显示面板
+export function removeHiddenPaneId(teamName: string, paneId: string): boolean
+```
+
+面板隐藏是一种 UI 功能，Teammate 仍在运行，只是不在主 swarm 视图中显示。适合已完成主要任务的 Teammate 但需要保持活跃状态的场景。
+
+## 团队允许路径管理
+
+`teamAllowedPaths` 是一个团队级的权限快捷方式列表：
+
+```typescript
+export type TeamAllowedPath = {
+  path: string      // 绝对目录路径（如 "/Users/admin/project/src"）
+  toolName: string  // 工具名（如 "Edit"、"Write"、"Bash"）
+  addedBy: string   // 由哪个 agentName 添加
+  addedAt: number   // 时间戳（毫秒）
+}
+```
+
+```typescript
+// 添加允许路径
+export async function addTeamAllowedPath(
+  teamName: string,
+  allowedPath: TeamAllowedPath,
+): Promise<boolean> {
+  const teamFile = await readTeamFileAsync(teamName)
+  if (!teamFile) return false
+
+  teamFile.teamAllowedPaths ??= []
+  // 检查是否已存在相同的路径+工具组合
+  const exists = teamFile.teamAllowedPaths.some(
+    p => p.path === allowedPath.path && p.toolName === allowedPath.toolName
+  )
+  if (!exists) {
+    teamFile.teamAllowedPaths.push(allowedPath)
+    await writeTeamFileAsync(teamName, teamFile)
+  }
+  return true
+}
+```
+
+## 操作模式快照（mode snapshot）
+
+当 Teammate 切换权限模式（如从 `default` 切到 `acceptEdits`）时，这个状态需要持久化到团队文件，以便 Leader 的 UI 能正确显示每个 Teammate 的当前模式：
+
+```typescript
+// 来自 backends/teammateModeSnapshot.ts
+export function updateMemberMode(
+  teamName: string,
+  tmuxPaneId: string,
+  mode: PermissionMode,
+): void {
+  const teamFile = readTeamFile(teamName)
+  if (!teamFile) return
+
+  const member = teamFile.members.find(m => m.tmuxPaneId === tmuxPaneId)
+  if (member) {
+    member.mode = mode
+    writeTeamFile(teamName, teamFile)
+  }
+}
+```
+
+## spawnTeam 输入 Schema
+
+`teamHelpers.ts` 还定义了创建团队时的输入 Schema（用于 AI 工具调用）：
+
+```typescript
+export const inputSchema = lazySchema(() =>
+  z.strictObject({
+    operation: z.enum(['spawnTeam', 'cleanup']).describe(
+      'Operation: spawnTeam to create a team, cleanup to remove team and task directories.'
+    ),
+    agent_type: z.string().optional().describe(
+      'Type/role of the team lead (e.g., "researcher", "test-runner"). ' +
+      'Used for team file and inter-agent coordination.'
+    ),
+    team_name: z.string().optional().describe(
+      'Name for the new team to create (required for spawnTeam).'
+    ),
+    description: z.string().optional().describe(
+      'Team description/purpose (only used with spawnTeam).'
+    ),
+  })
+)
+```
+
+两种操作：
+- `spawnTeam`：创建新团队，写入 `config.json`，返回 `SpawnTeamOutput`
+- `cleanup`：清理团队目录和任务目录
+
+## Git Worktree 集成
+
+`teamHelpers.ts` 还包含创建 git worktree 的工具函数，允许每个 Teammate 在独立的 git worktree 中工作，避免分支冲突：
+
+```typescript
+// 为 teammate 创建 git worktree
+export async function createWorktreeForTeammate(
+  repoPath: string,
+  teammateName: string,
+  teamName: string,
+): Promise<{ path: string; branch: string } | null> {
+  const worktreeBranch = `swarm/${sanitizeName(teamName)}/${sanitizeName(teammateName)}`
+  const worktreePath = join(repoPath, '.claude', 'worktrees', sanitizeName(teamName), sanitizeName(teammateName))
+
+  const result = await execFileNoThrowWithCwd(repoPath, gitExe(), [
+    'worktree', 'add', '-b', worktreeBranch, worktreePath
+  ])
+
+  if (result.code !== 0) return null
+  return { path: worktreePath, branch: worktreeBranch }
+}
+```
+
+## 小结
+
+`teamHelpers.ts` 是 Swarm 系统的"数据访问层"：
+
+| 功能类别 | 主要函数 |
+|---------|---------|
+| 路径计算 | `getTeamDir`, `getTeamFilePath` |
+| 配置读写 | `readTeamFile`, `writeTeamFile`, `readTeamFileAsync` |
+| 成员管理 | `removeTeammateFromTeamFile`, `removeMemberFromTeam` |
+| 面板隐藏 | `addHiddenPaneId`, `removeHiddenPaneId` |
+| 路径权限 | `addTeamAllowedPath` |
+| 团队清理 | `cleanupTeam` |
+| Worktree | `createWorktreeForTeammate` |
+
+所有函数都遵循同一个原则：**读取 → 修改 → 写回**，确保配置文件始终是完整的、有效的 JSON。
+
+<SourceRef file="source/src/utils/swarm/teamHelpers.ts" lines="1-100" />
+<SourceRef file="source/src/utils/swarm/teamHelpers.ts" lines="183-310" />
+
+<ArticleComplete />

@@ -1,0 +1,301 @@
+---
+sidebar_position: 5
+title: "实战解读：GlobTool / GrepTool"
+description: 解析文件搜索工具的实现原理，理解为何选择 ripgrep，以及 Glob+Grep 如何配合在大代码库中高效搜索
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 实战解读：GlobTool / GrepTool
+
+<DifficultyBadge level="进阶" />
+
+在 Claude Code 的日常工作中，"找到相关文件"是几乎所有任务的第一步。`GlobTool` 和 `GrepTool` 是这项能力的核心——一个按文件名模式搜索，一个按内容模式搜索。两者的设计看似简单，背后却有不少值得深究的工程选择。
+
+## GlobTool：基于文件名的模式匹配
+
+### 工具定义
+
+```typescript
+// source/src/tools/GlobTool/GlobTool.ts，第 57 行
+export const GlobTool = buildTool({
+  name: GLOB_TOOL_NAME,
+  searchHint: 'find files by name pattern or wildcard',
+  maxResultSizeChars: 100_000,
+  isConcurrencySafe() { return true },  // 只读，可以并行
+  isReadOnly() { return true },
+  isSearchOrReadCommand() {
+    return { isSearch: true, isRead: false }  // 在 UI 中折叠显示
+  },
+  // ...
+})
+```
+
+### 输入 Schema
+
+```typescript
+// source/src/tools/GlobTool/GlobTool.ts，第 26 行
+z.strictObject({
+  pattern: z.string().describe('The glob pattern to match files against'),
+  path: z
+    .string()
+    .optional()
+    .describe(
+      'The directory to search in. If not specified, the current working directory will be used.',
+    ),
+})
+```
+
+只有两个字段：匹配模式和搜索起点目录（可选）。极简的 schema 背后是"单一职责"的设计原则——GlobTool 只做一件事：文件名匹配。
+
+### 底层实现：glob 库
+
+GlobTool 使用 `../../utils/glob.js` 中封装的 `glob()` 函数：
+
+```typescript
+// source/src/tools/GlobTool/GlobTool.ts（call 方法简化）
+async call(input, context) {
+  const absolutePath = expandPath(input.path ?? getCwd())
+  const startTime = Date.now()
+
+  const files = await glob(input.pattern, {
+    cwd: absolutePath,
+    // 返回绝对路径
+    absolute: true,
+    // 遵循软链接
+    follow: true,
+  })
+
+  const durationMs = Date.now() - startTime
+  return {
+    data: {
+      durationMs,
+      numFiles: files.length,
+      filenames: files,
+      truncated: files.length > MAX_RESULTS,
+    },
+  }
+}
+```
+
+`glob.js` 封装的是 npm 包 `glob`（isaacs/node-glob），支持完整的 Glob 语法：
+- `**` — 递归匹配任意目录层次
+- `*` — 匹配单层目录中的任意字符
+- `?` — 匹配单个字符
+- `{a,b}` — 多选
+
+### UNC 路径安全防护
+
+```typescript
+// source/src/tools/GlobTool/GlobTool.ts，第 100 行
+async validateInput({ path }) {
+  if (path) {
+    const absolutePath = expandPath(path)
+
+    // 安全：跳过 UNC 路径的文件系统操作，防止 NTLM 凭据泄露
+    if (absolutePath.startsWith('\\\\') || absolutePath.startsWith('//')) {
+      return { result: true }
+    }
+    // ...
+  }
+}
+```
+
+UNC 路径（`\\server\share`）在 Windows 上会触发网络访问，可能泄露 NTLM 认证凭据给恶意服务器。这个检查直接跳过对 UNC 路径的 `stat()` 验证，同时阻止了无意的网络探测。
+
+## GrepTool：基于内容的正则搜索
+
+### 为什么选择 ripgrep（rg）？
+
+GrepTool 的底层搜索引擎是 `ripgrep`（rg）：
+
+```typescript
+// source/src/tools/GrepTool/GrepTool.ts，第 21 行
+import { ripGrep } from '../../utils/ripgrep.js'
+```
+
+选择 ripgrep 而不是原生 Node.js 文件遍历或系统 grep，原因有三：
+
+**1. 速度极快**：ripgrep 基于 Rust 的 regex crate，使用 SIMD 指令加速字符串匹配，比 GNU grep 快 3-10 倍，比 Node.js 手写遍历快更多。
+
+**2. 自动遵守 .gitignore**：ripgrep 默认跳过 `.gitignore`、`.git/`、`node_modules/` 等目录，这对代码仓库搜索至关重要。没有这个特性，搜索 `node_modules` 里的几万个文件会让结果毫无用处。
+
+**3. 丰富的输出格式**：ripgrep 支持 JSON 输出（用于程序化解析）、行号、上下文行、文件类型过滤等，这些功能 GrepTool 都直接暴露给了 Claude。
+
+### 丰富的输入 Schema
+
+GrepTool 的 schema 是三个工具中最复杂的：
+
+```typescript
+// source/src/tools/GrepTool/GrepTool.ts，第 33 行
+z.strictObject({
+  pattern: z.string().describe('正则表达式模式'),
+
+  // 搜索路径
+  path: z.string().optional(),
+
+  // 文件 glob 过滤（如 "*.ts"、"*.{ts,tsx}"）
+  glob: z.string().optional(),
+
+  // 输出模式
+  output_mode: z.enum(['content', 'files_with_matches', 'count']).optional(),
+
+  // 上下文行（等价于 rg -B/-A/-C）
+  '-B': semanticNumber(z.number().optional()),  // 匹配前 N 行
+  '-A': semanticNumber(z.number().optional()),  // 匹配后 N 行
+  '-C': semanticNumber(z.number().optional()),  // 匹配前后各 N 行
+
+  // 行号显示（默认 true）
+  '-n': semanticBoolean(z.boolean().optional()),
+
+  // 大小写不敏感
+  '-i': semanticBoolean(z.boolean().optional()),
+
+  // 文件类型过滤（比 glob 更高效）
+  type: z.string().optional(),  // 如 "js"、"py"、"rust"
+
+  // 结果分页
+  head_limit: semanticNumber(z.number().optional()),  // 默认 250
+  offset: semanticNumber(z.number().optional()),
+
+  // 多行匹配
+  multiline: semanticBoolean(z.boolean().optional()),
+})
+```
+
+`semanticNumber()` 和 `semanticBoolean()` 是特殊的 Zod 包装器，允许 Claude 传入字符串形式的数字/布尔值（如 `"3"` 代替 `3`，`"true"` 代替 `true`），增强了模型输出的容错性。
+
+### 三种输出模式
+
+```typescript
+// source/src/tools/GrepTool/GrepTool.ts，第 254 行
+
+// 模式一：files_with_matches（默认）
+// 只返回匹配文件的路径列表，适合"哪些文件包含这个函数？"
+// 示例输出：src/tools/BashTool/BashTool.tsx
+
+// 模式二：content
+// 返回匹配行的实际内容（类似 grep -n 输出），适合"这个函数是怎么实现的？"
+// 示例输出：
+// src/tools/BashTool/BashTool.tsx:434:  isConcurrencySafe(input) {
+
+// 模式三：count
+// 只返回每个文件的匹配数，适合"这个模式在代码库中出现了多少次？"
+// 示例输出：src/tools/BashTool/BashTool.tsx:3
+```
+
+默认使用 `files_with_matches` 而不是 `content`，这是有意的节省 token 的设计：通常 Claude 只需要知道"在哪个文件"，而不是"具体哪一行"。当需要看具体内容时，再用 `content` 模式或者用 `FileRead` 读取相关文件。
+
+### 默认结果上限与分页
+
+```typescript
+// source/src/tools/GrepTool/GrepTool.ts，第 108 行
+
+// 未指定时的默认上限
+const DEFAULT_HEAD_LIMIT = 250
+
+function applyHeadLimit<T>(
+  items: T[],
+  limit: number | undefined,
+  offset: number = 0,
+): { items: T[]; appliedLimit: number | undefined } {
+  // 显式传 0 表示"无限制"（逃生舱口）
+  if (limit === 0) {
+    return { items: items.slice(offset), appliedLimit: undefined }
+  }
+  const effectiveLimit = limit ?? DEFAULT_HEAD_LIMIT
+  // ...
+}
+```
+
+注释里解释了为什么要有 250 的默认上限："Unbounded content-mode greps can fill up to the 20KB persist threshold (~6-24K tokens/grep-heavy session)"——没有上限的搜索结果可能在一个搜索密集的会话里吃掉 2-24K token，严重浪费上下文窗口。
+
+### VCS 目录自动排除
+
+```typescript
+// source/src/tools/GrepTool/GrepTool.ts，第 94 行
+const VCS_DIRECTORIES_TO_EXCLUDE = [
+  '.git',   // Git
+  '.svn',   // SVN
+  '.hg',    // Mercurial
+  '.bzr',   // Bazaar
+  '.jj',    // Jujutsu (新兴 VCS)
+  '.sl',    // Sapling (Meta 内部 VCS)
+]
+```
+
+这些目录被自动排除，因为它们包含大量二进制文件和内部元数据，搜索它们几乎没有实用价值，反而会制造噪音和性能问题。
+
+## Glob + Grep 的协作模式
+
+两个工具被设计为**互补的搜索策略**，在实际使用中有清晰的分工：
+
+### 策略一：先 Glob 定位文件，再 Grep 搜索内容
+
+```
+Glob("**/*.ts", "src/tools/BashTool/")
+  → 找到 BashTool/ 下的所有 TS 文件
+
+Grep("isConcurrencySafe", "src/tools/BashTool/BashTool.tsx", "content")
+  → 在定位的文件中找到具体实现
+```
+
+这个模式在"我知道大概在哪个目录，但不确定具体文件"时最有效。
+
+### 策略二：只用 Grep 跨全库搜索
+
+```
+Grep("checkPermissions", undefined, "files_with_matches")
+  → 返回所有实现了 checkPermissions 的工具文件
+```
+
+当搜索结果可能分散在整个代码库时，直接用 Grep 的 `files_with_matches` 模式效率最高。
+
+### 策略三：Grep 的文件类型过滤
+
+```typescript
+// 比 glob 更高效的方式
+GrepTool.call({
+  pattern: "export.*Tool",
+  type: "ts",       // 只搜索 TypeScript 文件
+  output_mode: "files_with_matches",
+})
+```
+
+`type` 参数映射到 `rg --type ts`，ripgrep 内置了常见语言的文件扩展名映射（`ts` → `.ts`、`.tsx`），比手写 glob 更简洁也更不容易遗漏。
+
+## 性能考虑：大代码库下的优化
+
+在一个有十万个文件的代码库中，搜索效率至关重要：
+
+**GlobTool 的局限**：glob 库需要遍历整个目录树来收集文件名，对大型代码库比较慢（O(n) 文件系统 I/O）。
+
+**GrepTool 的优势**：ripgrep 使用并行文件 I/O，同时在多个文件上运行正则匹配（利用多核），速度远超单线程遍历。对大代码库，GrepTool 通常比先 Glob 再逐个 Read 快得多。
+
+**最优策略选择**：
+
+```
+代码库规模 < 1000 文件  → Glob 就够用，简单直观
+代码库规模 > 10000 文件 → 优先 Grep，或 Grep 后再 Glob 精确定位
+需要找特定函数/变量    → Grep content mode + 带 -C 上下文行
+需要发现所有相关文件    → Grep files_with_matches mode
+```
+
+值得注意的是，在 `getAllBaseTools()` 里有这样一段代码：
+
+```typescript
+// source/src/tools.ts，第 200 行
+// Ant 内部版本有 bfs/ugrep 嵌入到二进制中，
+// find/grep 命令别名指向这些快速工具，
+// 所以 Ant 内部不需要 GlobTool 和 GrepTool
+...(hasEmbeddedSearchTools() ? [] : [GlobTool, GrepTool]),
+```
+
+Anthropic 内部版本的 Claude Code 直接将 Bash 内的 `find`/`grep` 命令重定向到更快的内置工具，完全绕过了独立的 Glob/Grep 工具。这是性能优化的极致——把工具能力内嵌到 shell 环境中，减少工具调用的协议开销。
+
+<SourceRef file="source/src/tools/GlobTool/GlobTool.ts" lines="57-200" />
+<SourceRef file="source/src/tools/GrepTool/GrepTool.ts" lines="160-340" />
+
+<ArticleComplete />

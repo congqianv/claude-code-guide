@@ -1,0 +1,270 @@
+---
+sidebar_position: 6
+title: 记忆新鲜度：memoryAge.ts 与 memoryScan.ts 的老化机制
+description: 解析 Claude Code 如何通过时间戳跟踪记忆新鲜度并在回答时主动提示潜在过时风险
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 记忆新鲜度：memoryAge.ts 与 memoryScan.ts 的老化机制
+
+<DifficultyBadge level="进阶" />
+
+## 为什么记忆需要"新鲜度"概念？
+
+记忆的核心价值在于让 AI 在未来的对话中应用过去学到的知识。但记忆有一个天然的问题：**它是过去某个时间点的快照，而世界在不断变化**。
+
+一条 6 个月前保存的记忆：
+
+```markdown
+---
+name: project_db_schema
+description: users 表有 email 和 phone 两个字段
+type: project
+---
+users 表结构：id, email, phone, created_at
+```
+
+6 个月后，数据库 schema 很可能已经变了。如果 Claude 无条件信任这条记忆，可能会给出错误的建议。
+
+更危险的场景：
+
+```markdown
+---
+name: reference_auth_endpoint
+description: 认证 API 端点在 /api/v1/auth/login
+type: reference
+---
+POST /api/v1/auth/login — 登录端点（v1 版本）
+```
+
+如果 API 已经升级到 v2，v1 端点可能已经废弃，但记忆里仍然记录的是 v1。
+
+`memoryAge.ts` 提供的机制不是主动删除过期记忆，而是在**展示记忆时附加新鲜度警告**，让 Claude 知道这条记忆有多"旧"，从而主动去验证而不是盲目相信。
+
+## memoryAge.ts：三个精心设计的函数
+
+### memoryAgeDays：基础年龄计算
+
+```typescript
+// source/src/memdir/memoryAge.ts
+export function memoryAgeDays(mtimeMs: number): number {
+  return Math.max(0, Math.floor((Date.now() - mtimeMs) / 86_400_000))
+}
+```
+
+计算从文件修改时间（mtime）到现在经过的整天数：
+
+- `86_400_000` = 24 × 60 × 60 × 1000（一天的毫秒数）
+- `Math.floor` 向下取整（写于 23:59 的记忆，第二天 00:01 就是"1天前"）
+- `Math.max(0, ...)` 处理时钟回拨等异常情况（mtime 比当前时间更新）
+
+### memoryAge：人类可读的年龄
+
+```typescript
+export function memoryAge(mtimeMs: number): string {
+  const d = memoryAgeDays(mtimeMs)
+  if (d === 0) return 'today'
+  if (d === 1) return 'yesterday'
+  return `${d} days ago`
+}
+```
+
+将天数转换为人类友好的字符串：
+
+- `0天` → `"today"`
+- `1天` → `"yesterday"`
+- `N天` → `"N days ago"`
+
+这个函数的注释揭示了背后的认知科学考量：
+
+> Human-readable age string. Models are poor at date arithmetic — a raw ISO timestamp doesn't trigger staleness reasoning the way "47 days ago" does.
+
+LLM 在处理 ISO 时间戳时不会自动意识到"这很旧了"，但看到 "47 days ago" 时会自然触发"可能过时"的推理。这是一个针对 LLM 认知特点的提示工程技巧。
+
+### memoryFreshnessText：过时警告文本
+
+```typescript
+export function memoryFreshnessText(mtimeMs: number): string {
+  const d = memoryAgeDays(mtimeMs)
+  if (d <= 1) return ''  // 今天/昨天的记忆不需要警告
+  return (
+    `This memory is ${d} days old. ` +
+    `Memories are point-in-time observations, not live state — ` +
+    `claims about code behavior or file:line citations may be outdated. ` +
+    `Verify against current code before asserting as fact.`
+  )
+}
+```
+
+只对超过 1 天的记忆生成警告文本。警告文本包含三个要素：
+
+1. **年龄量化**：`"This memory is 47 days old"`（具体数字比"较旧"更有触发效果）
+2. **认知框架设定**：`"point-in-time observations, not live state"`（防止 Claude 把记忆当成实时数据）
+3. **具体行动建议**：`"Verify against current code before asserting as fact"`（明确下一步应该做什么）
+
+特别提到了 `"file:line citations"` —— 这是一个已知的高风险场景：记忆中记录了某函数在某文件第几行，但代码可能已经重构，这类声明最容易被断言为事实。
+
+### memoryFreshnessNote：带包装的提示
+
+```typescript
+export function memoryFreshnessNote(mtimeMs: number): string {
+  const text = memoryFreshnessText(mtimeMs)
+  if (!text) return ''
+  return `<system-reminder>${text}</system-reminder>\n`
+}
+```
+
+将警告文本包装在 `<system-reminder>` 标签中。这个标签有特殊语义——Claude 会将其中的内容视为系统级提示而非用户内容，赋予更高的遵从优先级。
+
+`memoryFreshnessText`（无包装）和 `memoryFreshnessNote`（有包装）分开提供，是因为不同调用场景需要不同的包装方式：
+- `FileReadTool` 直接读取记忆文件时，用 `memoryFreshnessNote`（需要包装）
+- `messages.ts` 的 `relevant_memories` 注入时，外层已有 `wrapMessagesInSystemReminder`，用 `memoryFreshnessText`（避免重复包装）
+
+## memoryScan.ts 中的时间戳传递
+
+`memoryAge.ts` 的函数能发挥作用，前提是记忆文件的修改时间（`mtimeMs`）被全程携带。这个设计在 `memoryScan.ts` 中体现得很清楚：
+
+```typescript
+// source/src/memdir/memoryScan.ts
+export type MemoryHeader = {
+  filename: string
+  filePath: string
+  mtimeMs: number      // 修改时间戳，全程携带
+  description: string | null
+  type: MemoryType | undefined
+}
+
+// 扫描时同步读取 mtime
+const { content, mtimeMs } = await readFileInRange(
+  filePath, 0, FRONTMATTER_MAX_LINES, undefined, signal,
+)
+// readFileInRange 内部做了 stat，返回了 mtimeMs
+return {
+  filename: relativePath,
+  filePath,
+  mtimeMs,  // 携带到 MemoryHeader
+  description: frontmatter.description || null,
+  type: parseMemoryType(frontmatter.type),
+}
+```
+
+`readFileInRange` 在读取文件内容的同时做了 `stat` 调用，返回了 `mtimeMs`。注释说明了这个"单次读取"设计的原因：
+
+> Single-pass: readFileInRange stats internally and returns mtimeMs, so we read-then-sort rather than stat-sort-read. For the common case (N ≤ 200) this halves syscalls vs a separate stat round.
+
+在一次文件读取中同时获取内容和元数据，避免"先 stat 排序，再 read 内容"需要两倍系统调用的模式。
+
+## 时间戳在系统中的流向
+
+`mtimeMs` 从扫描到最终展示的完整路径：
+
+```
+memoryScan.scanMemoryFiles()
+    │ MemoryHeader.mtimeMs
+    ▼
+findRelevantMemories()
+    │ RelevantMemory.mtimeMs
+    ▼
+messages.ts (注入到用户上下文)
+    │ memoryFreshnessText(mtimeMs)
+    ▼
+Claude 的输入上下文
+（"This memory is 47 days old..."）
+```
+
+```typescript
+// source/src/memdir/findRelevantMemories.ts
+export type RelevantMemory = {
+  path: string
+  mtimeMs: number   // 从 MemoryHeader 携带过来
+}
+```
+
+`findRelevantMemories` 的返回值也携带了 `mtimeMs`，让调用方无需再做额外的 `stat` 调用即可计算新鲜度。
+
+## 记忆排序的新鲜度偏向
+
+在 `scanMemoryFiles` 中，记忆文件按 `mtimeMs` 从新到旧排序：
+
+```typescript
+.sort((a, b) => b.mtimeMs - a.mtimeMs)  // 降序：最新的排在前面
+.slice(0, MAX_MEMORY_FILES)              // 取前 200 个
+```
+
+这意味着当记忆文件超过 200 个时，**最旧的记忆会被直接排除在候选池之外**，甚至不会送到 Sonnet 进行相关性判断。
+
+这是一个隐式的"老化"机制：超过容量上限的旧记忆不会被主动删除，但会因为排序靠后而自然失效（不再被检索）。用户可以通过删除文件或更新文件内容（touch 操作会更新 mtime）来重新激活旧记忆。
+
+## 格式化清单中的时间戳
+
+在 `formatMemoryManifest` 中，时间戳也被注入到送给 Sonnet 的清单文本中：
+
+```typescript
+// source/src/memdir/memoryScan.ts
+export function formatMemoryManifest(memories: MemoryHeader[]): string {
+  return memories
+    .map(m => {
+      const tag = m.type ? `[${m.type}] ` : ''
+      const ts = new Date(m.mtimeMs).toISOString()  // ISO 时间戳
+      return m.description
+        ? `- ${tag}${m.filename} (${ts}): ${m.description}`
+        : `- ${tag}${m.filename} (${ts})`
+    })
+    .join('\n')
+}
+```
+
+注意这里用的是 ISO 时间戳格式（如 `2026-03-15T10:30:00.000Z`），而不是人类友好的 "47 days ago"。
+
+这里的设计是：送给 Sonnet 选相关性时，需要精确时间戳（可以做精确比较）；送给主模型展示时，用人类友好格式（更容易触发过时推理）。两个用途，两种格式，分别优化。
+
+## 没有主动清理的设计选择
+
+值得注意的是：Claude Code 的记忆系统**没有自动清理机制**。旧记忆不会被自动删除，`memoryScan.ts` 也没有扫描过期记忆并删除它们的逻辑。
+
+这是一个有意识的设计选择，理由可以从源码设计推断：
+
+1. **用户自主权**：用户可以通过 `/forget` 命令删除记忆，自主控制记忆的生命周期
+2. **透明性**：自动删除在用户不知情时可能删除重要记忆（虽然"旧"但仍然有效的记忆）
+3. **成本考量**：对每条记忆做"是否过期"的判断本身需要 AI 分析，成本不低
+4. **新鲜度警告代替删除**：通过警告机制，让 Claude 在使用旧记忆时主动验证，比删除更安全
+
+对比做法是 `memoryAge.ts` 采用的"警告而非删除"策略：旧记忆不消失，但在使用时会被标注"请验证"。
+
+## MEMORY_DRIFT_CAVEAT：系统级老化意识
+
+除了 `memoryAge.ts` 提供的文件级新鲜度之外，`memoryTypes.ts` 中还有一个系统级的"记忆漂移"提示，被注入到每次会话的系统提示中：
+
+```typescript
+// source/src/memdir/memoryTypes.ts
+export const MEMORY_DRIFT_CAVEAT =
+  '- Memory records can become stale over time. Use memory as context for what was true at a given point in time. Before answering the user or building assumptions based solely on information in memory records, verify that the memory is still correct and up-to-date by reading the current state of the files or resources. If a recalled memory conflicts with current information, trust what you observe now — and update or remove the stale memory rather than acting on it.'
+```
+
+这段文字建立了 Claude 使用记忆的基本认知框架：
+
+- 记忆是"**某个时间点**的快照"（point-in-time observation），不是实时状态
+- **当前观察 > 记忆内容**（如果有冲突，信任当前读取的结果）
+- 发现过时记忆应该**更新或删除**，而不是"记下冲突继续用旧数据回答"
+
+## 小结
+
+Claude Code 的记忆新鲜度机制体现了一种务实的工程哲学：
+
+**不试图自动判断"哪条记忆过期了"（这很难判断正确），而是把新鲜度信息透明地传递给 Claude，让 AI 自己在上下文中做出合适的判断**。
+
+具体体现在三个层次：
+
+1. **文件级**：`memoryAge.ts` 计算文件 mtime，生成人类友好的年龄字符串和警告文本，注入到具体记忆的展示上下文中
+2. **候选池级**：`memoryScan.ts` 按 mtime 倒序排序，超过 200 个时旧文件自然被排除出候选池
+3. **系统级**：`MEMORY_DRIFT_CAVEAT` 在系统提示中建立"记忆会过时"的基础认知
+
+这三层机制共同作用，在不删除任何记忆的情况下，有效降低了旧记忆被盲目信任的风险。
+
+<SourceRef file="source/src/memdir/memoryAge.ts" lines="1-53" />
+<SourceRef file="source/src/memdir/memoryScan.ts" lines="1-94" />
+
+<ArticleComplete />

@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
 /* ===== Default Theme (Docusaurus Blue) ===== */
 :root {
   --ifm-color-primary: #2563eb;
@@ -14,6 +16,12 @@
   --site-bg: #ffffff;
   --card-bg: #f8fafc;
   --card-border: #e2e8f0;
+
+  /* Homepage accent */
+  --hp-accent: #f59e0b;
+  --hp-accent-dark: #d97706;
+  --hp-accent-glow: rgba(245, 158, 11, 0.15);
+  --hp-accent-subtle: rgba(245, 158, 11, 0.06);
 }
 
 [data-theme='dark'] {
@@ -29,6 +37,12 @@
   --site-bg: #1e1e2e;
   --card-bg: #2a2a3a;
   --card-border: #3f3f5a;
+
+  /* Homepage accent dark */
+  --hp-accent: #fbbf24;
+  --hp-accent-dark: #f59e0b;
+  --hp-accent-glow: rgba(251, 191, 36, 0.18);
+  --hp-accent-subtle: rgba(251, 191, 36, 0.07);
 }
 
 /* ===== Global Styles ===== */

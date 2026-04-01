@@ -73,11 +73,16 @@ const config: Config = {
           label: '开始学习',
         },
         {
+          to: '/about',
+          position: 'left',
+          label: '关于我',
+        },
+        {
           type: 'custom-themeSwitcher',
           position: 'right',
         },
         {
-          href: 'https://github.com/your-github-username/claude-code-guide',
+          href: 'https://github.com/wzf1997/claude-code-guide',
           label: 'GitHub',
           position: 'right',
         },

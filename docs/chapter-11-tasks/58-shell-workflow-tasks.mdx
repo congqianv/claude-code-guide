@@ -1,0 +1,241 @@
+---
+sidebar_position: 5
+title: LocalShellTask / LocalWorkflowTask：后台任务与工作流
+description: 解析 LocalShellTask 后台 shell 命令执行机制，以及 LocalWorkflowTask 工作流概念
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# LocalShellTask / LocalWorkflowTask：后台任务与工作流
+
+<DifficultyBadge level="进阶" />
+
+在 Claude Code 的 Task 系统中，`LocalShellTask` 和 `LocalWorkflowTask` 负责在本地执行 shell 命令和工作流脚本。与直接通过 BashTool 执行命令不同，这两种任务类型以**异步后台**方式运行，允许 AI 在命令执行的同时继续其他工作。
+
+## LocalShellTask：后台 Shell 命令
+
+### 设计背景
+
+当 AI 需要执行一个耗时的 shell 命令（比如运行完整测试套件、执行 `npm install`、构建 Docker 镜像），有两种选择：
+
+1. **前台执行（BashTool）**：命令运行时 AI 阻塞等待，完成后才能继续
+2. **后台执行（LocalShellTask）**：命令在后台运行，AI 可以同时处理其他工作，命令完成后通过通知机制告知 AI
+
+LocalShellTask 实现了第二种模式，是 BashTool 的异步后台版本。
+
+### 核心状态结构
+
+```typescript
+// LocalShellTaskState 的关键字段（来自 guards.ts）
+type LocalShellTaskState = TaskStateBase & {
+  type: 'local_bash'
+  command: string         // 实际执行的 shell 命令
+  shellCommand: ShellCommand | null  // 进程引用（完成后设为 null）
+  isBackgrounded: boolean // 是否已进入后台（前台任务可按 ESC 背景化）
+  agentId?: AgentId       // 所属代理（子代理的任务归属于子代理）
+  kind?: 'bash' | 'monitor' // 显示类型（普通 bash vs monitor 工具）
+  lastReportedTotalLines: number // 上次汇报的输出行数（增量读取用）
+  completionStatusSentInAttachment: boolean // 完成状态是否已随附输出发送
+}
+```
+
+### 两种创建方式
+
+#### 1. 直接后台启动（spawnShellTask）
+
+当 BashTool 明确选择在后台运行时：
+
+```typescript
+// source/src/tasks/LocalShellTask/LocalShellTask.tsx
+export async function spawnShellTask(input, context): Promise<TaskHandle> {
+  const taskId = shellCommand.taskOutput.taskId
+  const taskState: LocalShellTaskState = {
+    ...createTaskStateBase(taskId, 'local_bash', description, toolUseId),
+    type: 'local_bash',
+    status: 'running',
+    isBackgrounded: true,  // 直接后台
+    ...
+  }
+  registerTask(taskState, setAppState)
+
+  // 调用 shellCommand.background() 让进程在后台运行
+  shellCommand.background(taskId)
+
+  // 注册完成回调
+  void shellCommand.result.then(async result => {
+    // 发送 task-notification 通知 AI
+    enqueueShellNotification(taskId, description, status, exitCode, setAppState)
+  })
+}
+```
+
+#### 2. 前台转后台（registerForeground → backgroundTask）
+
+当用户执行了一个前台命令，但命令运行时间太长，用户可以按 `Esc` 将其切换到后台：
+
+```
+前台 BashTool 执行命令
+    │
+    ├── 命令运行 > N 秒 → 显示 "BackgroundHint"（提示可以 Esc 背景化）
+    │
+    └── 用户按 Esc → backgroundTask() → isBackgrounded = true
+                                        命令继续在后台运行
+```
+
+### 输出管理：磁盘文件 + 增量读取
+
+LocalShellTask 的所有输出（stdout + stderr）都写入一个磁盘文件（`TaskOutput`），而不是保留在内存中。这有几个好处：
+
+1. **无内存压力**：即使命令输出几 GB 数据，也不会影响进程内存
+2. **可随时读取**：AI 可以在命令运行时随时调用 `TaskOutputTool` 读取当前输出
+3. **持久化**：进程重启后，历史输出仍然可以查看
+
+`TaskOutputTool` 的输入参数：
+
+```typescript
+// source/src/tools/TaskOutputTool/TaskOutputTool.tsx
+const inputSchema = z.strictObject({
+  task_id: z.string().describe('The task ID to get output from'),
+  block: semanticBoolean(z.boolean().default(true))
+    .describe('Whether to wait for completion'),  // 是否等待完成
+  timeout: z.number().min(0).max(600000).default(30000)
+    .describe('Max wait time in ms'),  // 最长等待 10 分钟
+})
+```
+
+`block: true`（默认）表示 AI 会等待任务完成或超时；`block: false` 表示立即返回当前已有的输出（适合"先启动多个任务再轮询"的模式）。
+
+### Stall 检测：防止命令卡住
+
+LocalShellTask 内置了一个"卡住检测"（stall watchdog）机制：
+
+```typescript
+// source/src/tasks/LocalShellTask/LocalShellTask.tsx
+const STALL_CHECK_INTERVAL_MS = 5_000   // 每 5 秒检查一次
+const STALL_THRESHOLD_MS = 45_000       // 45 秒无新输出触发警告
+const STALL_TAIL_BYTES = 1024           // 读取最后 1KB 输出做模式匹配
+```
+
+检测逻辑：
+1. 每 5 秒检查输出文件大小
+2. 如果 45 秒内文件大小没有增长，读取最后 1KB 内容
+3. 分析输出模式，判断是否像"等待键盘输入"的 prompt（如 `[y/n]?`、`Password:`、`Press Enter...`）
+4. 如果确认是等待交互输入，发送一个特殊的 task-notification 通知 AI
+
+这防止了 AI 无限期等待一个已经卡住的命令，是一个非常实用的可靠性设计。
+
+### 任务完成通知
+
+命令结束后，LocalShellTask 发送 `task-notification` 消息，格式如下：
+
+```xml
+<task-notification>
+<task-id>b3f8k2m9</task-id>
+<tool-use-id>toolu_01X...</tool-use-id>
+<output-file>/tmp/claude/tasks/b3f8k2m9/output</output-file>
+<status>completed</status>
+<summary>Background command "npm test" completed (exit code 0)</summary>
+</task-notification>
+```
+
+注意与 LocalAgentTask 不同：LocalShellTask 的通知包含 `output-file` 路径（指向磁盘上的完整输出），而不是结果内容本身。这是因为 shell 命令的输出可能很大，不适合直接内嵌在 XML 消息中。
+
+### 任务取消
+
+通过 `TaskStopTool` 停止运行中的后台 shell 任务：
+
+```typescript
+// killTask 的实现（killShellTasks.ts）
+// 1. 查找任务的 ShellCommand 引用
+// 2. 调用 shellCommand.kill() 向子进程发送 SIGTERM/SIGKILL
+// 3. 等待进程退出
+// 4. 更新任务状态为 'killed'
+// 5. 发送 killed 通知给父代理
+```
+
+## LocalWorkflowTask：工作流任务
+
+### 概念与设计哲学
+
+`LocalWorkflowTask` 是 Claude Code 中用于执行"工作流脚本"（Workflow Scripts）的任务类型。工作流是预先定义好的自动化脚本，类似于 CI/CD pipeline 的配置——有明确的步骤序列、分支逻辑和成功/失败条件。
+
+工作流系统通过 feature flag `WORKFLOW_SCRIPTS` 控制是否启用：
+
+```typescript
+// source/src/commands.ts
+const workflowsCmd = feature('WORKFLOW_SCRIPTS')
+  ? require('./commands/workflows/index.js')
+  : undefined
+```
+
+在 v2.1.88 中，WORKFLOW_SCRIPTS feature flag 默认关闭，`LocalWorkflowTask` 本身是一个 stub（占位实现）。
+
+### 工作流与 LocalShellTask 的区别
+
+| 特性 | LocalShellTask | LocalWorkflowTask |
+|------|---------------|------------------|
+| 输入 | 任意 shell 命令字符串 | 预定义工作流脚本路径/名称 |
+| 结构 | 单个命令 | 多步骤有序执行 |
+| 分支逻辑 | 无（由 shell 自行处理） | 内置条件分支 |
+| 可重用性 | 低（每次手写命令） | 高（脚本可复用） |
+| 可审计性 | 中 | 高（工作流有版本控制） |
+| 适用场景 | 即时性任务 | 标准化的重复性工作流程 |
+
+### 实际使用场景
+
+工作流系统的典型使用场景是将标准化的开发流程封装成可复用的脚本：
+
+- **代码审查工作流**：拉取 PR → 运行 linter → 运行测试 → 生成报告
+- **部署工作流**：构建 → 测试 → 推送镜像 → 滚动更新
+- **环境搭建工作流**：克隆仓库 → 安装依赖 → 配置环境变量 → 启动服务
+
+用户通过斜杠命令调用工作流（如 `/deploy-staging`），工作流命令在 UI 中带有"(workflow)"标记，与普通命令区分。
+
+## 两种任务类型的输出查看
+
+两种任务都通过 `TaskOutputTool` 读取输出，AI 可以在任务运行时实时查看：
+
+```
+AI 启动后台任务（返回 task_id: "b3f8k2m9"）
+    │
+    ├── AI 继续其他工作...
+    │
+    ├── AI 调用 TaskOutput { task_id: "b3f8k2m9", block: false }
+    │       └── 返回当前已有的部分输出
+    │
+    ├── AI 继续其他工作...
+    │
+    └── 收到 <task-notification> 通知：任务完成
+            └── AI 调用 TaskOutput { task_id: "b3f8k2m9", block: false }
+                    └── 返回完整输出
+```
+
+或者直接等待：
+
+```
+AI 调用 TaskOutput { task_id: "b3f8k2m9", block: true, timeout: 60000 }
+    └── 最多等待 60 秒，任务完成后立即返回完整输出
+```
+
+## 进程退出时的清理
+
+两种任务都注册了进程退出清理回调：
+
+```typescript
+const unregisterCleanup = registerCleanup(async () => {
+  killTask(taskId, setAppState)
+})
+```
+
+当 Claude Code 进程收到退出信号（SIGTERM、SIGINT）时，会依次 kill 所有注册的后台任务，防止僵尸进程。
+
+## 小结
+
+`LocalShellTask` 是 Claude Code 异步化执行 shell 命令的核心机制，通过磁盘文件输出、stall 检测、增量读取和 task-notification 构建了一套完整的后台命令管理体系。`LocalWorkflowTask` 则在此基础上提供了更高层次的工作流自动化能力。理解这两种任务类型，有助于构建更高效的 AI 辅助开发流程。
+
+<SourceRef file="source/src/tasks/LocalShellTask/LocalShellTask.tsx" lines="1-252" />
+<SourceRef file="source/src/tools/TaskOutputTool/TaskOutputTool.tsx" lines="1-60" />
+
+<ArticleComplete />

@@ -1,0 +1,225 @@
+---
+sidebar_position: 6
+title: contextCollapse：折叠 vs 压缩，两种截然不同的上下文管理哲学
+description: 解析 contextCollapse 与 compact 的根本区别，理解折叠的工作原理和适用场景
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# contextCollapse：折叠 vs 压缩，两种截然不同的上下文管理哲学
+
+<DifficultyBadge level="进阶" />
+
+在 Claude Code 的上下文管理体系中，`contextCollapse`（上下文折叠）是一个与 `compact`（压缩）完全不同路线的实验性系统。理解这两者的区别，有助于深入理解 Claude Code 团队在上下文管理上的不同思考路径。
+
+> **注意**：contextCollapse 是 Anthropic 内部的 ant-only 实验性功能，通过 feature flag `CONTEXT_COLLAPSE` 控制，在公开发行版中以 stub 形式存在。本文基于源码注释和相关 UI 代码进行推断性分析。
+
+## 核心区别：信息是否可逆
+
+compact（压缩）和 contextCollapse（折叠）的最根本区别在于**信息是否可逆**：
+
+| 维度 | compact（压缩） | contextCollapse（折叠） |
+|------|----------------|------------------------|
+| 信息保留 | 不可逆（转为摘要） | 可逆（原文保留，可恢复） |
+| 操作对象 | 整个对话历史 | 特定的"跨度"（span） |
+| 存储位置 | 摘要取代原内容 | 原内容存储在磁盘，上下文只有摘要 |
+| 恢复能力 | 无法恢复原始消息 | 理论上可以展开查看原文 |
+| 适用场景 | 对话历史太长，需要整体清理 | 特定大型内容块的临时折叠 |
+
+compact 是**有损压缩**——将完整的对话历史替换为一段摘要文字，原始内容永久丢失。
+
+contextCollapse 是**无损折叠**——将内容移出上下文（减少 token 占用），但原文保留在磁盘上，必要时可以重新注入。这类似于文本编辑器中的"代码折叠"功能：你把代码块折叠起来，但它并没有消失，点击就能展开。
+
+## 折叠的工作机制
+
+根据 `ContextVisualization.tsx` 中的 UI 代码，可以推断折叠系统的核心状态：
+
+```typescript
+// source/src/components/ContextVisualization.tsx（推断自 CollapseStatus 组件）
+const stats = {
+  collapsedSpans: number,  // 已折叠的"跨度"数量
+  collapsedMessages: number,  // 这些跨度包含的消息数
+  stagedSpans: number,  // 已暂存待折叠的跨度数
+  health: {
+    totalSpawns: number,   // 总折叠 spawn 次数
+    totalErrors: number,   // 折叠失败次数
+    totalEmptySpawns: number,  // 空跑次数（无可折叠内容）
+    emptySpawnWarningEmitted: boolean,
+    lastError: string | null,
+  }
+}
+```
+
+UI 层展示示例（来自 `CollapseStatus` 组件）：
+
+```
+Context strategy: collapse (3 spans summarized (47 msgs), 1 staged)
+```
+
+或在出现错误时：
+
+```
+Context strategy: collapse (2 spans summarized (31 msgs))
+Collapse errors: 1/5 spawns failed (last: timeout waiting for ctx-agent...)
+```
+
+## 触发机制：两个关键阈值
+
+从 `autoCompact.ts` 的注释中可以得到折叠的触发阈值：
+
+```
+Collapse 折叠触发点    Autocompact 触发点   Blocking 限制
+      90%               ~93% (effective)        95%
+       |                      |                   |
+0%    |         |             |         |         |    100%
+      ↑                       ↑                   ↑
+   commit-start           autocompact            block
+   开始阶段折叠           自动压缩（被禁用）      完全阻塞
+```
+
+注释原文：
+
+```
+// Context-collapse mode: same suppression. Collapse IS the context
+// management system when it's on — the 90% commit / 95% blocking-spawn
+// flow owns the headroom problem. Autocompact firing at effective-13k
+// (~93% of effective) sits right between collapse's commit-start (90%)
+// and blocking (95%), so it would race collapse and usually win, nuking
+// granular context that collapse was about to save.
+```
+
+当 contextCollapse 启用时，autocompact **被禁用**，因为两者会产生竞争：autocompact 在 93% 触发，collapse 在 90% 已经开始工作，如果 autocompact 在这中间插入，会破坏 collapse 精心构建的上下文结构。
+
+## 折叠 Agent：marble_origami
+
+contextCollapse 使用一个专门的内部 agent（querySource = `'marble_origami'`）来执行折叠操作。这个奇特的代号出现在多处防递归检查中：
+
+```typescript
+// source/src/services/compact/autoCompact.ts
+if (feature('CONTEXT_COLLAPSE')) {
+  // marble_origami 是 ctx-agent——如果它自己的上下文爆了
+  // 然后 autocompact 触发，runPostCompactCleanup 会调用
+  // resetContextCollapse() 从而销毁主线程的 committed log
+  // （模块级状态，跨 fork 共享）。
+  if (querySource === 'marble_origami') {
+    return false
+  }
+}
+```
+
+"marble_origami"（大理石折纸）这个名字形象地描述了这个 agent 的职责：将上下文精巧地折叠，同时保持完整性。它作为独立的 forked agent 运行，不会影响主对话的进行。
+
+## 折叠的粒度：span（跨度）
+
+与 compact 对整个历史一刀切不同，contextCollapse 以"span"（跨度）为单位操作。一个 span 是消息列表中一段连续的片段，通常对应一个完整的工具调用序列或讨论主题。
+
+```
+消息历史（简化）：
+[用户: 分析这段代码] ─┐
+[助手: 好的，先读文件]  |  span 1（已折叠）
+[工具: FileRead]      |  → 替换为摘要: "读取并分析了 utils.py"
+[助手: 分析结果是...]  ─┘
+
+[用户: 修改 X 函数]  ─┐
+[助手: 使用 Edit]    |  span 2（已折叠）
+[工具: FileEdit]     |  → 替换为摘要: "修改了 utils.py 中的 X 函数"
+[助手: 修改完成]     ─┘
+
+[用户: 运行测试]      ← 当前活跃（未折叠）
+[助手: 执行 pytest]
+[工具: Bash: ...]
+```
+
+这种粒度控制使得折叠更加精准——只折叠"已经完成"的工作单元，保留"进行中"的上下文。
+
+## collapse vs compact 的使用场景对比
+
+**适合 contextCollapse 的场景：**
+
+- 长时间持续的开发会话，每个工作单元相对独立
+- 工具调用密集型任务（大量文件读取、搜索、编辑）
+- 需要保留"可以回溯查看历史"能力的场景
+- 对话进展可预测、结构清晰的任务
+
+**适合 compact 的场景：**
+
+- 需要立即释放大量 token（紧急情况）
+- 对话历史混乱、难以识别清晰工作单元
+- 用户手动触发，想要"重新开始"的感觉
+- 任何不支持 contextCollapse 功能的外部部署
+
+## contextCollapse 被禁用时的后备机制
+
+当 contextCollapse 不可用或被禁用时，系统会自动切换回 autocompact：
+
+```typescript
+// source/src/services/compact/autoCompact.ts
+export function isAutoCompactEnabled(): boolean {
+  // ... 其他检查
+
+  // 如果 contextCollapse 启用，autocompact 被接管
+  if (feature('CONTEXT_COLLAPSE')) {
+    const { isContextCollapseEnabled } = require('../contextCollapse/index.js')
+    if (isContextCollapseEnabled()) return false
+  }
+
+  return userConfig.autoCompactEnabled
+}
+```
+
+环境变量 `CLAUDE_CONTEXT_COLLAPSE` 也提供了运行时覆盖能力：
+
+```bash
+# 强制启用（即使 GrowthBook 未下发）
+CLAUDE_CONTEXT_COLLAPSE=1 claude
+
+# 强制禁用（即使 GrowthBook 已下发）
+CLAUDE_CONTEXT_COLLAPSE=0 claude
+```
+
+## 与 UI 的集成
+
+contextCollapse 的折叠状态在 `/context` 命令的显示中可见。`ContextVisualization.tsx` 的 `CollapseStatus` 组件只在 `CONTEXT_COLLAPSE` feature 启用时渲染：
+
+```typescript
+function CollapseStatus() {
+  if (feature("CONTEXT_COLLAPSE")) {
+    const { getStats, isContextCollapseEnabled } = require('../services/contextCollapse/index.js')
+
+    if (!isContextCollapseEnabled()) return null
+
+    const s = getStats()
+    const parts = []
+    if (s.collapsedSpans > 0) {
+      parts.push(`${s.collapsedSpans} span(s) summarized (${s.collapsedMessages} msgs)`)
+    }
+    if (s.stagedSpans > 0) {
+      parts.push(`${s.stagedSpans} staged`)
+    }
+
+    return <Text dimColor>Context strategy: collapse ({parts.join(", ")})</Text>
+  }
+  return null
+}
+```
+
+在用户看到的 `/context` 输出中，会有一行额外的状态信息，让用户了解折叠系统的运行状态。
+
+## 总结：两种哲学
+
+| 哲学 | compact（压缩） | contextCollapse（折叠） |
+|------|----------------|------------------------|
+| 核心比喻 | "把书压缩成摘要" | "把书放进书架，需要时取出" |
+| 信息保真度 | 摘要级别（可能失真） | 原文保留（可恢复） |
+| 系统复杂度 | 相对简单 | 需要 marble_origami agent |
+| 适用版本 | 所有版本（公开） | 仅 ant-only 实验版 |
+
+contextCollapse 代表了一个更雄心勃勃的方向：让 Claude Code 能够优雅地管理无限长的工作会话，同时不丢失任何历史信息。compact 则是当前生产环境中更实用、更稳定的解决方案。
+
+<SourceRef file="source/src/services/contextCollapse/index.ts" lines="1-9" />
+<SourceRef file="source/src/components/ContextVisualization.tsx" lines="1-71" />
+<SourceRef file="source/src/services/compact/autoCompact.ts" lines="170-225" />
+
+<ArticleComplete />

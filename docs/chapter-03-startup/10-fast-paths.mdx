@@ -1,0 +1,217 @@
+---
+sidebar_position: 2
+title: 快速路径：--version、--help 如何被短路处理
+description: 理解 Claude Code 的短路处理机制，以及为什么不需要为简单命令加载全部应用栈
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# 快速路径：--version、--help 如何被短路处理
+
+<DifficultyBadge level="入门" />
+
+当你运行 `claude --version` 的时候，你会得到几乎即时的响应。这背后是一个精心设计的"短路处理"机制。本文我们来详细了解这个机制是如何运作的，以及为什么它对用户体验如此重要。
+
+## 什么是短路处理（Short-Circuit）
+
+短路处理是一种编程模式：当程序检测到某些特殊条件时，**立即执行最小化的操作并返回**，而不是走完整的初始化流程。
+
+你可以把它想象成一个餐厅的前台：
+
+- 正常情况：顾客进门 → 引导入座 → 拿菜单 → 点餐 → 上菜 → 收银
+- 短路情况：顾客进门只是问"你们几点营业？" → 前台直接回答 → 顾客离开
+
+前台不会为了回答一个简单问题而完成整套"接待流程"。Claude Code 的快速路径也是同样的道理。
+
+## 为什么需要短路处理？
+
+### 加载 Claude Code 完整应用的代价
+
+Claude Code 是一个功能丰富的交互式 TUI 应用，它的完整启动路径需要：
+
+1. 加载 React + Ink UI 框架
+2. 初始化 commander.js 命令行解析器（定义几十个命令和选项）
+3. 读取并解析用户配置文件（`~/.claude/` 目录）
+4. 连接 MCP（Model Context Protocol）服务器
+5. 加载插件和技能（Skills）
+6. 初始化 GrowthBook 功能开关
+7. 执行数据迁移检查
+8. 启动 Keychain 预取
+9. ...（还有更多）
+
+这些操作加在一起，在普通机器上可能需要数百毫秒甚至更长时间。
+
+### 对比：如果没有短路会怎样？
+
+假设没有短路处理，执行 `claude --version` 的流程可能是：
+
+```
+claude --version
+  → 加载 React (几十个模块)
+  → 初始化 Ink TUI
+  → 读取 ~/.claude/settings.json
+  → 检查 Keychain 里的 OAuth Token
+  → 连接 MCP 服务器（可能超时）
+  → 初始化 commander.js（解析所有命令定义）
+  → commander 发现 --version
+  → 打印版本号
+  → 退出（耗时：500ms ~ 2s）
+```
+
+而有了短路处理：
+
+```
+claude --version
+  → 检查 args[0] === '--version'
+  → 打印内联的版本号常量
+  → 退出（耗时：< 10ms）
+```
+
+差别是数十倍到数百倍的性能提升。
+
+## 被短路处理的完整命令列表
+
+通过阅读 `cli.tsx` 源码，可以整理出所有走快速路径的命令：
+
+### 第一级：零模块加载（最快）
+
+```typescript
+// 完全不加载任何模块，直接输出版本号
+if (args.length === 1 && (args[0] === '--version' || args[0] === '-v' || args[0] === '-V')) {
+  // MACRO.VERSION 是构建时内联的常量，不是运行时读取
+  console.log(`${MACRO.VERSION} (Claude Code)`);
+  return; // 函数结束，没有 import，没有文件读取
+}
+```
+
+这是整个 CLI 中最快的路径，版本号在构建时就已经被硬编码进了字节码，连 `package.json` 都不需要读取。
+
+### 第二级：轻量模块加载（快）
+
+这类路径会加载 `startupProfiler`，然后根据标志动态加载最小化的功能模块：
+
+| 命令/标志 | 触发条件 | 加载的模块 |
+|-----------|----------|------------|
+| `--daemon-worker <kind>` | 内部 daemon supervisor 派生 | `daemon/workerRegistry.js` |
+| `--claude-in-chrome-mcp` | Chrome 集成 MCP 服务器 | `utils/claudeInChrome/mcpServer.js` |
+| `--chrome-native-host` | Chrome 原生主机 | `utils/claudeInChrome/chromeNativeHost.js` |
+| `--computer-use-mcp` | 计算机使用 MCP（企业功能） | `utils/computerUse/mcpServer.js` |
+| `environment-runner` | 无头 BYOC 运行器 | `environment-runner/main.js` |
+| `self-hosted-runner` | 自托管运行器 | `self-hosted-runner/main.js` |
+
+### 第三级：需要配置加载（中等）
+
+这类路径需要读取用户配置，但仍然不需要加载 React/UI 栈：
+
+```typescript
+// daemon 子命令需要读取配置和初始化 sinks
+if (feature('DAEMON') && args[0] === 'daemon') {
+  enableConfigs();    // 读取配置文件
+  initSinks();        // 初始化数据上报
+  const { daemonMain } = await import('../daemon/main.js');
+  await daemonMain(args.slice(1));
+  return;
+}
+```
+
+| 命令/标志 | 需要配置 | 需要认证 |
+|-----------|----------|----------|
+| `daemon` | 是 | 否 |
+| `ps`, `logs`, `attach`, `kill` | 是 | 否 |
+| `--bg`, `--background` | 是 | 否 |
+| `new`, `list`, `reply` (模板) | 是 | 否 |
+
+### 第四级：需要认证检查（较重）
+
+```typescript
+// remote-control 需要完整的认证 + 功能门控检查
+if (feature('BRIDGE_MODE') && (args[0] === 'remote-control' || ...)) {
+  enableConfigs();  // 1. 读取配置
+
+  // 2. 认证检查（必须在 GrowthBook 之前）
+  const { getClaudeAIOAuthTokens } = await import('../utils/auth.js');
+  if (!getClaudeAIOAuthTokens()?.accessToken) {
+    exitWithError(BRIDGE_LOGIN_ERROR);
+  }
+
+  // 3. GrowthBook 功能门控
+  const disabledReason = await getBridgeDisabledReason();
+
+  // 4. 版本检查
+  const versionError = checkBridgeMinVersion();
+
+  // 5. 企业策略检查
+  await waitForPolicyLimitsToLoad();
+  if (!isPolicyAllowed('allow_remote_control')) { ... }
+
+  await bridgeMain(args.slice(1));
+  return;
+}
+```
+
+### 完整流程（最慢，走 main.tsx）
+
+只有当所有快速路径都不匹配时，才会加载完整的 `main.tsx`：
+
+```typescript
+// 没有特殊标志，加载完整 CLI
+const { startCapturingEarlyInput } = await import('../utils/earlyInput.js');
+startCapturingEarlyInput(); // 先开始捕获输入，防止用户提前打字丢失
+
+const { main: cliMain } = await import('../main.js'); // 这里触发大量模块加载
+await cliMain();
+```
+
+## --help 的特殊情况
+
+你可能注意到 `--help` 并不在快速路径列表里。这是因为 `--help` 的输出依赖于 commander.js 注册的所有命令和选项列表，这些信息只有在 `main.tsx` 完全加载（commander 实例被完整构建）之后才能生成。
+
+所以 `claude --help` 会走**完整的初始化路径**，然后由 commander.js 拦截 `--help` 标志并输出帮助信息。这也是为什么 `--help` 比 `--version` 慢的根本原因。
+
+## 设计启示：动态 import 的威力
+
+这套设计的核心技术是 **ES Module 的动态 `import()`**。整个 `cli.tsx` 文件中没有任何顶层静态 import，所有模块加载都是按需进行的：
+
+```typescript
+// 传统写法（静态 import）
+import { runDaemonWorker } from '../daemon/workerRegistry.js'; // 总是被加载
+
+// Claude Code 的写法（动态 import）
+if (args[0] === '--daemon-worker') {
+  const { runDaemonWorker } = await import('../daemon/workerRegistry.js'); // 只在需要时加载
+  await runDaemonWorker(args[1]);
+}
+```
+
+静态 import 的模块在文件被加载时**立即执行**；动态 import 则把模块加载推迟到实际需要的时刻。对于 `--version` 这种路径，`daemon/workerRegistry.js` 永远不会被加载。
+
+## 代码的"哨兵卫士"模式
+
+观察每个快速路径分支的结构，你会发现一个统一的模式：
+
+```typescript
+if (满足条件) {
+  profileCheckpoint('路径名称'); // 记录性能打点
+  // ... 执行操作 ...
+  return; // 必须 return，阻止继续向下执行
+}
+```
+
+每个分支末尾的 `return` 是关键——它确保路径之间互斥，一旦命中某条路径，不会继续执行后续的判断。这种模式被称为"卫语句（Guard Clause）"，使代码逻辑清晰，易于维护。
+
+## 总结
+
+Claude Code 的快速路径设计体现了几个重要原则：
+
+1. **最小化原则**：只加载完成当前任务所必需的最少代码
+2. **按需加载**：利用动态 `import()` 实现真正的懒加载
+3. **构建时优化**：用 `feature()` 门控 + `MACRO.VERSION` 把部分工作提前到编译期
+4. **用户体验优先**：`--version` 这样的高频简单命令响应速度必须极快
+
+这些设计原则不仅适用于 CLI 工具，对于任何需要快速启动的 Node.js 应用都有参考价值。
+
+<SourceRef file="source/src/entrypoints/cli.tsx" lines="33-298" />
+
+<ArticleComplete />

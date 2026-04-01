@@ -1,0 +1,203 @@
+---
+sidebar_position: 1
+title: "Hooks 系统全景：设计哲学与核心价值"
+description: 从架构视角理解 Claude Code Hook 系统的设计动机、4个核心应用场景，以及 Hook 与 Tool 的根本区别
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Hooks 系统全景：设计哲学与核心价值
+
+<DifficultyBadge level="入门" />
+
+## 为什么需要 Hook？
+
+Claude Code 是一个 AI 驱动的编程助手，它调用各种工具（Bash、Write、Edit 等）来完成任务。在大多数情况下，这个默认行为已经够用。但当你需要将 Claude Code 融入特定的团队工作流、企业合规要求、或者个人开发习惯时，问题就出现了：
+
+- 所有 `rm -rf` 命令在执行前都应该有日志记录
+- 每次写入文件后，CI/CD 系统应该收到通知
+- 在某些受限环境下，访问特定路径的工具调用需要额外审批
+- 会话开始时，需要自动设置某些环境变量
+
+这些需求都有一个共同点：**在 Claude Code 的生命周期的特定时刻，注入自定义行为**。这正是 Hook 系统存在的理由。
+
+## Hook 的本质：生命周期扩展点
+
+Hook（钩子）是一种软件设计模式，允许外部代码在预定义的时间点介入一个系统的执行流程。Claude Code 的 Hook 系统遵循这一思想，在 AI 与工具交互的各个关键节点暴露扩展接口。
+
+```
+用户输入 → [SessionStart Hook] → Claude 思考
+                                    ↓
+工具调用决策 → [PreToolUse Hook] → 工具执行 → [PostToolUse Hook]
+                                    ↓
+Claude 响应 → [Stop Hook] → 输出给用户
+```
+
+这些扩展点让 Hook 成为一个**无侵入式的扩展机制**——你不需要修改 Claude Code 的任何源码，只需要配置几行 JSON 和几个 shell 脚本，就能改变系统的行为。
+
+## Hook 与传统扩展机制的比较
+
+### 与传统回调（Callback）的区别
+
+传统回调通常是程序内部的函数指针，需要编写代码来注册。Claude Code 的 Hook 则是**外部进程**，通过 shell 命令实现，无需任何编程知识即可配置：
+
+```json
+// hooks.json 示例
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        { "type": "command", "command": "echo '执行 Bash 命令' >> /tmp/audit.log" }
+      ]
+    }
+  ]
+}
+```
+
+### 与中间件（Middleware）的区别
+
+Web 框架中的中间件（如 Express.js 的 `app.use()`）形成一个管道，每个中间件都能修改请求/响应并传递给下一层。Claude Code 的 Hook 更接近于**事件监听器**，但同时保留了拦截（阻断或修改）能力：
+
+| 特性 | 中间件 | Claude Code Hook |
+|------|--------|-----------------|
+| 执行方式 | 链式调用，必须 `next()` | 独立执行，通过 exit code 决定后续行为 |
+| 实现语言 | 与宿主语言相同 | 任意语言（shell、Python、Node.js...） |
+| 配置方式 | 代码注册 | JSON 文件 |
+| 修改能力 | 修改请求/响应对象 | 修改工具输入，或通过 JSON 输出注入数据 |
+
+### 与插件（Plugin）的区别
+
+Claude Code 有独立的插件系统（Plugin），插件通常提供完整的功能集（新工具、新命令等）。Hook 则更轻量，专注于**拦截和观察**现有行为，而不是新增功能。
+
+## Hook 的 4 个核心应用场景
+
+### 1. 审计与合规（Audit & Compliance）
+
+在监管严格的行业（金融、医疗、政府），所有系统操作都需要留下审计痕迹。通过 `PostToolUse` Hook，可以在每次工具执行后将操作记录到外部系统：
+
+```bash
+#!/bin/bash
+# audit_hook.sh - 记录所有工具调用
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id')
+
+echo "$TIMESTAMP | $SESSION_ID | $TOOL_NAME | $(echo $INPUT | jq -c '.tool_input')" >> /var/log/claude-audit.log
+```
+
+### 2. 拦截与安全防护（Interception & Security）
+
+通过 `PreToolUse` Hook，可以在工具执行前检查操作是否符合安全策略，并在发现风险时阻断执行：
+
+```bash
+#!/bin/bash
+# security_check.sh - 阻止对 /etc/ 的写入操作
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+if [[ "$TOOL_NAME" =~ ^(Write|Edit)$ ]] && [[ "$FILE_PATH" =~ ^/etc/ ]]; then
+  echo "安全策略：禁止修改 /etc/ 目录下的文件" >&2
+  exit 2  # exit code 2 = 阻断工具执行，并将 stderr 展示给 Claude
+fi
+```
+
+### 3. 功能扩展（Extension）
+
+Hook 可以在 Claude Code 的标准工作流之外附加额外的逻辑。例如，`PostToolUse` Hook 可以在文件写入后自动运行代码格式化：
+
+```bash
+#!/bin/bash
+# auto_format.sh - 文件写入后自动格式化
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+
+if [[ "$TOOL_NAME" == "Write" ]] && [[ "$FILE_PATH" =~ \.ts$ ]]; then
+  prettier --write "$FILE_PATH" 2>/dev/null || true
+fi
+```
+
+### 4. 系统集成（Integration）
+
+将 Claude Code 接入现有的 DevOps 工具链：通知 Slack、触发 CI/CD 流水线、更新项目管理系统等：
+
+```bash
+#!/bin/bash
+# notify_slack.sh - 发送 Slack 通知
+INPUT=$(cat)
+TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name')
+if [[ "$TOOL_NAME" == "Bash" ]]; then
+  COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
+  curl -s -X POST "$SLACK_WEBHOOK_URL" \
+    -H 'Content-type: application/json' \
+    --data "{\"text\": \"Claude 执行了命令: \`$COMMAND\`\"}" > /dev/null
+fi
+```
+
+## Hook 与 Tool 的根本区别
+
+理解 Hook 和 Tool 的区别是正确使用 Hook 系统的前提：
+
+| 维度 | Tool（工具） | Hook（钩子） |
+|------|-------------|-------------|
+| **发起者** | Claude 主动调用 | 系统在生命周期节点自动触发 |
+| **目的** | 执行具体任务（读文件、运行命令） | 观察/拦截/扩展 Claude 的行为 |
+| **配置方式** | 代码定义（TypeScript 接口） | 配置文件（JSON + shell 脚本） |
+| **执行时机** | Claude 决策后 | 工具调用前后、会话生命周期节点 |
+| **影响范围** | 仅当前工具调用 | 可以影响 Claude 的后续决策 |
+| **返回值** | 工具结果注入到对话 | exit code + JSON 输出控制执行流 |
+| **权限** | 受权限系统控制 | 拥有完整 shell 权限（需谨慎） |
+
+**一句话总结：Tool 是 Claude 的"手"，Hook 是系统的"神经末梢"。** Tool 做事情，Hook 监视和控制事情的发生。
+
+## Hooks 系统架构概览
+
+```
+配置来源层
+├── ~/.claude/settings.json          (用户全局设置)
+├── .claude/settings.json            (项目级设置)
+├── .claude/settings.local.json      (本地覆盖)
+├── 插件 hooks.json                  (插件提供的 Hook)
+└── 会话级 Hook (SessionHooks)       (运行时动态注册)
+
+事件触发层
+├── 生命周期事件: SessionStart, SessionEnd, Setup
+├── 工具事件: PreToolUse, PostToolUse, PostToolUseFailure
+├── 压缩事件: PreCompact, PostCompact
+├── 权限事件: PermissionRequest, PermissionDenied
+├── 子代理事件: SubagentStart, SubagentStop
+└── 其他: Stop, Notification, UserPromptSubmit...
+
+执行层
+├── command Hook  → spawn shell 子进程
+├── prompt Hook   → 调用 LLM 评估
+├── agent Hook    → 启动子代理验证
+├── http Hook     → 发送 HTTP 请求
+└── function Hook → 执行内存中的 TypeScript 回调
+
+结果处理层
+├── exit 0        → 成功，stdout 可注入上下文
+├── exit 2        → 阻断执行，stderr 展示给 Claude/用户
+└── exit 其他     → 非阻断错误，stderr 仅展示给用户
+```
+
+## 小结
+
+Claude Code 的 Hook 系统是一个经过精心设计的扩展机制，它在正确的层次上暴露了正确的扩展点：
+
+- **对用户友好**：通过 JSON 配置文件和普通 shell 脚本即可使用
+- **功能完整**：支持观察、拦截、修改、阻断等多种操作
+- **安全可控**：工作区信任检查、超时限制、错误隔离
+- **与核心解耦**：Hook 失败不会崩溃主程序
+
+在接下来的文章中，我们将逐一深入每个 Hook 类型的实现细节。
+
+<SourceRef file="source/src/utils/hooks.ts" lines="1-166" />
+<SourceRef file="source/src/utils/hooks/hooksConfigManager.ts" lines="1-267" />
+
+<ArticleComplete />

@@ -1,0 +1,393 @@
+---
+sidebar_position: 2
+title: "Hook 类型全解：types/hooks.ts 数据结构拆解"
+description: 深入解析 HookCommand、HookMatcher、HookEvent 等核心类型定义，以及 exit code 语义和 JSON 输出协议
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# Hook 类型全解：types/hooks.ts 数据结构拆解
+
+<DifficultyBadge level="进阶" />
+
+## 概述
+
+在开始编写 Hook 之前，必须理解其数据结构。Claude Code 的 Hook 类型定义分散在两个核心文件中：
+
+- `source/src/schemas/hooks.ts` — Hook 命令的 Zod 验证模式（schema）
+- `source/src/types/hooks.ts` — Hook 输入/输出的运行时类型
+
+本文通过逐一拆解这些类型，帮助读者建立对 Hook 系统的完整认知。
+
+## HookEvent：Hook 事件枚举
+
+所有可用的 Hook 事件名称定义在 `agentSdkTypes.ts` 中，通过 `HOOK_EVENTS` 数组导出。目前 Claude Code 支持以下 **25 个** Hook 事件：
+
+```typescript
+// 工具生命周期
+'PreToolUse'          // 工具执行前
+'PostToolUse'         // 工具执行后（成功）
+'PostToolUseFailure'  // 工具执行后（失败）
+'PermissionDenied'    // 工具被权限系统拒绝后
+
+// 会话生命周期
+'SessionStart'        // 会话启动（startup/resume/clear/compact）
+'SessionEnd'          // 会话结束（clear/logout/exit 等）
+'Setup'               // 仓库初始化/维护（init/maintenance）
+'Stop'                // Claude 即将结束本轮响应
+'StopFailure'         // 本轮因 API 错误（限流等）结束
+
+// 子代理生命周期
+'SubagentStart'       // 子代理（Agent 工具调用）启动
+'SubagentStop'        // 子代理即将结束
+
+// 压缩生命周期
+'PreCompact'          // 对话压缩前
+'PostCompact'         // 对话压缩后
+
+// 权限系统
+'PermissionRequest'   // 权限对话框弹出时
+'Notification'        // 系统发送通知时
+
+// 用户交互
+'UserPromptSubmit'    // 用户提交 Prompt 时
+
+// 协作系统
+'TeammateIdle'        // 协作者即将空闲
+'TaskCreated'         // 任务被创建
+'TaskCompleted'       // 任务被标记完成
+
+// MCP 集成
+'Elicitation'         // MCP 服务器请求用户输入
+'ElicitationResult'   // 用户响应 MCP 问询后
+
+// 配置与文件系统
+'ConfigChange'        // 配置文件变更
+'InstructionsLoaded'  // CLAUDE.md 或规则文件被加载
+'CwdChanged'          // 工作目录变更
+'FileChanged'         // 被监视的文件变更
+
+// 工作区管理
+'WorktreeCreate'      // 创建隔离 worktree
+'WorktreeRemove'      // 删除 worktree
+```
+
+## HookCommand：Hook 执行方式
+
+每个 Hook 配置项都是一个 `HookCommand` 对象，目前支持 4 种类型（通过 `type` 字段区分）：
+
+### 1. command Hook — Shell 命令
+
+最常见的类型，执行任意 shell 命令：
+
+```typescript
+type BashCommandHook = {
+  type: 'command'
+  command: string           // 要执行的 shell 命令
+  if?: string               // 条件过滤：仅当满足权限规则语法时执行
+  shell?: 'bash' | 'powershell'  // 指定 shell 解释器（默认 bash）
+  timeout?: number          // 超时秒数（默认 10 分钟）
+  statusMessage?: string    // 执行期间显示的 spinner 提示文字
+  once?: boolean            // 为 true 时执行一次后自动移除
+  async?: boolean           // 为 true 时在后台运行，不阻塞主流程
+  asyncRewake?: boolean     // 为 true 时后台运行，exit code 2 时唤醒模型
+}
+```
+
+**`if` 条件字段**是一个重要的性能优化：它使用与权限系统相同的匹配语法（如 `"Bash(git *)"`, `"Read(*.ts)"`），在 spawn 子进程之前先过滤。只有当条件匹配时，才真正执行 Hook 命令，避免不必要的进程启动开销。
+
+### 2. prompt Hook — LLM 评估
+
+将 Hook 逻辑委托给另一个 LLM 实例评估：
+
+```typescript
+type PromptHook = {
+  type: 'prompt'
+  prompt: string     // LLM 提示词，用 $ARGUMENTS 占位符引用 Hook 输入
+  if?: string
+  timeout?: number
+  model?: string     // 指定模型（如 "claude-sonnet-4-6"）
+  statusMessage?: string
+  once?: boolean
+}
+```
+
+### 3. agent Hook — 子代理验证
+
+启动一个完整的子代理来执行验证逻辑，适用于复杂的语义验证场景：
+
+```typescript
+type AgentHook = {
+  type: 'agent'
+  prompt: string     // 验证描述（如 "验证单元测试是否通过"）
+  if?: string
+  timeout?: number   // 默认 60 秒
+  model?: string
+  statusMessage?: string
+  once?: boolean
+}
+```
+
+### 4. http Hook — HTTP 请求
+
+将 Hook 输入以 JSON 格式 POST 到远端 HTTP 端点：
+
+```typescript
+type HttpHook = {
+  type: 'http'
+  url: string             // 目标 URL（必须是有效的 URL）
+  if?: string
+  timeout?: number
+  headers?: Record<string, string>   // 附加请求头（支持 $ENV_VAR 插值）
+  allowedEnvVars?: string[]  // 允许插值的环境变量白名单
+  statusMessage?: string
+  once?: boolean
+}
+```
+
+`http` Hook 的安全注意事项：环境变量只有在 `allowedEnvVars` 中明确列出的，才会被插值到 `headers` 中。未列出的变量会被替换为空字符串，防止意外泄露敏感信息。
+
+## HookMatcher：工具名称匹配规则
+
+`HookMatcher` 定义了一个 Hook 的触发条件：
+
+```typescript
+type HookMatcher = {
+  matcher?: string       // 匹配字符串（支持精确匹配和 glob 模式）
+  hooks: HookCommand[]   // 匹配成功时执行的 Hook 命令列表
+}
+```
+
+`matcher` 字段的匹配目标因事件类型而异：
+
+| 事件类型 | matcher 匹配字段 | 示例值 |
+|---------|----------------|-------|
+| `PreToolUse`, `PostToolUse` | `tool_name` | `"Bash"`, `"Write"`, `"*"` |
+| `SessionStart` | `source` | `"startup"`, `"resume"`, `"compact"` |
+| `Setup` | `trigger` | `"init"`, `"maintenance"` |
+| `PreCompact`, `PostCompact` | `trigger` | `"manual"`, `"auto"` |
+| `Notification` | `notification_type` | `"permission_prompt"`, `"idle_prompt"` |
+| `FileChanged` | 文件名 | `".envrc"`, `".env"` |
+
+**matcher 为空时**，该 Hook 匹配所有该事件类型的触发，等同于通配符。
+
+## HooksSettings：顶层配置结构
+
+`HooksSettings` 是 `settings.json` 中 `hooks` 字段的完整类型：
+
+```typescript
+type HooksSettings = Partial<Record<HookEvent, HookMatcher[]>>
+```
+
+即：每个 Hook 事件对应一个 `HookMatcher[]` 数组，多个 Matcher 串行执行：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "echo $HOOK_INPUT | jq '.tool_input.command' >> audit.log" }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          { "type": "command", "command": "./security-check.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## HookInput：传递给 Hook 的输入数据
+
+每次 Hook 执行时，系统会将结构化的 JSON 数据通过 **stdin** 传递给 Hook 进程。所有事件共享一个基础字段集，再加上事件特定字段：
+
+### 基础字段（所有事件通用）
+
+```typescript
+// createBaseHookInput() 构造这些字段
+{
+  session_id: string,        // 当前会话 ID
+  transcript_path: string,   // 会话记录文件路径
+  cwd: string,               // 当前工作目录
+  permission_mode?: string,  // 权限模式（default/acceptEdits/...）
+  agent_id?: string,         // 子代理 ID（仅子代理触发时有值）
+  agent_type?: string,       // 代理类型
+}
+```
+
+### PreToolUse 特定字段
+
+```typescript
+{
+  hook_event_name: 'PreToolUse',
+  tool_name: string,           // 工具名称（"Bash", "Write" 等）
+  tool_input: ToolInput,       // 工具的输入参数（工具不同，结构不同）
+  tool_use_id: string,         // 工具调用的唯一 ID
+}
+```
+
+### PostToolUse 特定字段
+
+```typescript
+{
+  hook_event_name: 'PostToolUse',
+  tool_name: string,
+  tool_input: ToolInput,
+  tool_response: ToolResponse, // 工具的执行结果
+  tool_use_id: string,
+}
+```
+
+### SessionStart 特定字段
+
+```typescript
+{
+  hook_event_name: 'SessionStart',
+  source: 'startup' | 'resume' | 'clear' | 'compact',
+  agent_type?: string,
+  model?: string,
+}
+```
+
+### PreCompact 特定字段
+
+```typescript
+{
+  hook_event_name: 'PreCompact',
+  trigger: 'manual' | 'auto',
+  custom_instructions: string | null,
+}
+```
+
+### PostCompact 特定字段
+
+```typescript
+{
+  hook_event_name: 'PostCompact',
+  trigger: 'manual' | 'auto',
+  compact_summary: string,  // 压缩后的摘要文本
+}
+```
+
+## HookJSONOutput：Hook 的 JSON 输出协议
+
+Hook 可以通过 stdout 返回 JSON 格式的控制数据（也可以不返回任何内容）。输出分为**同步响应**和**异步响应**两种：
+
+### 异步响应（首行输出）
+
+```typescript
+type AsyncHookJSONOutput = {
+  async: true
+  asyncTimeout?: number  // 异步超时毫秒数
+}
+```
+
+当 Hook 的 stdout **第一行**是 `{"async":true}` 时，系统立即将该进程转入后台，不等待其完成。
+
+### 同步响应（完整输出）
+
+```typescript
+type SyncHookJSONOutput = {
+  continue?: boolean          // false = 停止 Claude 继续运行
+  suppressOutput?: boolean    // true = 不将 stdout 显示给用户
+  stopReason?: string         // continue=false 时展示的停止原因
+  decision?: 'approve' | 'block'  // 权限决策（与 reason 配合）
+  reason?: string             // 权限决策的说明
+  systemMessage?: string      // 展示给用户的警告消息
+  hookSpecificOutput?: { ... } // 事件特定字段（见下文）
+}
+```
+
+### hookSpecificOutput：事件特定的输出
+
+**PreToolUse 事件：**
+```typescript
+{
+  hookEventName: 'PreToolUse',
+  permissionDecision?: 'allow' | 'deny' | 'ask',  // 权限决策
+  permissionDecisionReason?: string,
+  updatedInput?: Record<string, unknown>,  // 修改后的工具输入
+  additionalContext?: string,              // 注入 Claude 上下文的额外信息
+}
+```
+
+**PostToolUse 事件：**
+```typescript
+{
+  hookEventName: 'PostToolUse',
+  additionalContext?: string,
+  updatedMCPToolOutput?: unknown,  // 覆盖 MCP 工具的输出
+}
+```
+
+**SessionStart 事件：**
+```typescript
+{
+  hookEventName: 'SessionStart',
+  additionalContext?: string,
+  initialUserMessage?: string,  // 注入初始用户消息
+  watchPaths?: string[],        // 注册文件监视路径
+}
+```
+
+## exit code 语义：控制执行流的关键
+
+exit code 是最简单也是最重要的 Hook 输出机制：
+
+| exit code | 含义 | 详细行为 |
+|-----------|------|---------|
+| **0** | 成功 | stdout 可用于上下文注入（事件不同行为略有差异） |
+| **2** | 阻断 | 将 stderr 展示给 Claude，阻止工具/操作继续执行 |
+| **其他（1,3...）** | 非阻断错误 | 将 stderr 仅展示给用户，继续执行 |
+
+**重要：exit code 2 是"阻断"信号**，不是"错误"信号。这个约定让 Hook 能够以一种结构化的方式向 Claude 发送阻止信息，同时保持明确的语义区分（"我有意拒绝这个操作" vs "我意外崩溃了"）。
+
+不同事件对 exit code 的处理略有不同，例如：
+- `SessionStart` 和 `Setup` 事件：阻断错误（exit 2）会被**忽略**，因为会话初始化不应该被 Hook 阻止
+- `PreToolUse`：exit 2 阻止工具执行，stderr 作为阻断原因展示给 Claude
+- `Stop`：exit 2 显示 stderr 给 Claude 并**继续对话**（不是终止，而是让 Claude 看到这个信息后继续）
+
+## 会话级 Hook 的特殊类型
+
+除了可以持久化到 JSON 文件的 4 种 `HookCommand` 类型外，系统内部还支持一种无法持久化的 `FunctionHook`：
+
+```typescript
+type FunctionHook = {
+  type: 'function'
+  id?: string                         // 用于后续移除的标识符
+  timeout?: number                    // 超时毫秒数
+  callback: FunctionHookCallback      // TypeScript 函数
+  errorMessage: string                // 检查失败时的错误信息
+  statusMessage?: string
+}
+
+type FunctionHookCallback = (
+  messages: Message[],
+  signal?: AbortSignal,
+) => boolean | Promise<boolean>
+```
+
+`FunctionHook` 是内部系统（如技能系统、会话初始化逻辑）使用的高性能 Hook 类型，通过 `addFunctionHook()` 在运行时注册，不涉及任何进程创建。
+
+## 小结
+
+掌握这些类型定义，是理解 Claude Code Hook 系统的基础：
+
+1. **HookEvent** — 明确了系统的 25 个扩展点
+2. **HookCommand** — 定义了 4 种执行方式（command/prompt/agent/http）
+3. **HookMatcher** — 决定了 Hook 在哪些条件下触发
+4. **HookInput/HookJSONOutput** — 规定了数据交换协议
+5. **exit code** — 提供了最简洁的控制信号机制
+
+<SourceRef file="source/src/schemas/hooks.ts" lines="1-220" />
+<SourceRef file="source/src/types/hooks.ts" lines="1-291" />
+<SourceRef file="source/src/utils/hooks/hooksConfigManager.ts" lines="26-267" />
+
+<ArticleComplete />

@@ -1,0 +1,230 @@
+---
+sidebar_position: 5
+title: sessionMemoryCompact.ts：会话记忆的保留与丢弃决策
+description: 解析会话记忆压缩机制，理解哪些信息在压缩时值得保留
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# sessionMemoryCompact.ts：会话记忆的保留与丢弃决策
+
+<DifficultyBadge level="深度" />
+
+在 Claude Code 的压缩体系中，`sessionMemoryCompact.ts` 代表了一种介于"全量压缩"和"microCompact"之间的中间策略。它的核心思想是：**在完全替换对话历史之前，先尝试通过保留关键的会话记忆来延缓这一时刻的到来**。
+
+## 什么是 Session Memory？
+
+Session Memory（会话记忆）与 `~/memory/` 目录中的持久化记忆是两个不同的概念：
+
+| 维度 | Session Memory | memdir 记忆 |
+|------|---------------|-------------|
+| 生命周期 | 当前会话 | 跨会话持久化 |
+| 存储位置 | 内存（临时文件） | `~/.claude/memory/` |
+| 内容来源 | 本次对话提炼 | 用户手动保存 / 自动提炼 |
+| 用途 | 当前任务的工作状态 | 长期用户偏好和知识 |
+
+Session Memory 通过一个独立的 `session_memory` querySource 运行，由专门的 SessionMemory agent 在对话进行过程中提炼关键信息。当触发压缩时，这些已经提炼好的会话记忆可以作为压缩后的上下文基础，避免从头生成摘要。
+
+## 压缩阈值配置
+
+`sessionMemoryCompact.ts` 定义了一套专用的压缩配置：
+
+```typescript
+// source/src/services/compact/sessionMemoryCompact.ts
+export type SessionMemoryCompactConfig = {
+  /** 压缩后最少保留的 token 数 */
+  minTokens: number
+  /** 压缩后最少保留的含文本块消息数量 */
+  minTextBlockMessages: number
+  /** 压缩后最多保留的 token 数（硬上限） */
+  maxTokens: number
+}
+
+export const DEFAULT_SM_COMPACT_CONFIG: SessionMemoryCompactConfig = {
+  minTokens: 10_000,
+  minTextBlockMessages: 5,
+  maxTokens: 40_000,
+}
+```
+
+这三个参数共同定义了"保留什么、保留多少"：
+- `minTokens = 10,000`：压缩后至少保留 1 万 token 的上下文，确保 Claude 有足够的工作空间
+- `minTextBlockMessages = 5`：至少保留最近 5 条含文字的消息，确保最近的对话不被截断
+- `maxTokens = 40,000`：硬上限 4 万 token，防止"保留太多"导致压缩效果不佳
+
+这些配置值也支持通过 GrowthBook 远程动态下发：
+
+```typescript
+async function initSessionMemoryCompactConfig(): Promise<void> {
+  if (configInitialized) return
+  configInitialized = true
+
+  const remoteConfig = await getDynamicConfig_BLOCKS_ON_INIT<
+    Partial<SessionMemoryCompactConfig>
+  >('tengu_sm_compact_config', {})
+
+  // 只使用有效的正数覆盖默认值
+  const config: SessionMemoryCompactConfig = {
+    minTokens:
+      remoteConfig.minTokens && remoteConfig.minTokens > 0
+        ? remoteConfig.minTokens
+        : DEFAULT_SM_COMPACT_CONFIG.minTokens,
+    // ...
+  }
+  setSessionMemoryCompactConfig(config)
+}
+```
+
+## 保留决策：哪些消息值得保留
+
+压缩时的保留决策遵循以下优先级：
+
+### 1. 消息类型过滤
+
+函数 `hasTextBlocks()` 判断一条消息是否包含实质性的文本内容（而非纯工具调用）：
+
+```typescript
+export function hasTextBlocks(message: Message): boolean {
+  if (message.type === 'assistant') {
+    const content = message.message.content
+    return content.some(block => block.type === 'text')
+  }
+  if (message.type === 'user') {
+    const content = message.message.content
+    if (typeof content === 'string') {
+      return content.length > 0
+    }
+    if (Array.isArray(content)) {
+      return content.some(block => block.type === 'text')
+    }
+  }
+  return false
+}
+```
+
+纯工具调用的消息（只有 `tool_use`/`tool_result` 块）在压缩时优先级较低。
+
+### 2. 工具调用配对保护
+
+一个重要约束：**不能把 tool_use 和 tool_result 分开**。如果要保留一条包含 `tool_result` 的用户消息，必须同时保留对应的包含 `tool_use` 的助手消息：
+
+```typescript
+export function adjustIndexToPreserveAPIInvariants(
+  messages: Message[],
+  startIndex: number,
+): number {
+  // 检查 startIndex 开始的消息中是否有 tool_result
+  // 如果有，向前查找对应的 tool_use 消息
+  // 将 startIndex 调整为包含该 tool_use 的位置
+
+  // 还要处理 streaming 场景：同一 message.id 的多条消息
+  // （thinking 块、tool_use 块可能分散在不同的 message 对象中）
+}
+```
+
+这是一个容易出错的地方。源码中有详细的注释说明了四种 bug 场景：
+
+```
+Tool pair scenario（工具配对场景）:
+  Index N:   assistant, message.id: X, content: [thinking]
+  Index N+1: assistant, message.id: X, content: [tool_use: ORPHAN_ID]
+  Index N+2: assistant, message.id: X, content: [tool_use: VALID_ID]
+  Index N+3: user, content: [tool_result: ORPHAN_ID, tool_result: VALID_ID]
+
+  如果 startIndex = N+2，旧代码会漏掉 ORPHAN_ID 的 tool_use，
+  导致 API 报错：orphan tool_result references non-existent tool_use
+```
+
+### 3. 最近优先原则
+
+在满足工具调用配对约束的前提下，保留最新的消息。具体来说，算法从消息列表末尾向前遍历，直到累计 token 数达到 `maxTokens` 上限：
+
+```
+[最旧的消息] ... [被压缩部分] | [保留边界] [保留的最新消息] ... [最新消息]
+                              ↑
+                        startIndex
+```
+
+startIndex 是使得 `sum(tokens from startIndex to end) <= maxTokens` 的最大索引。
+
+## 与全量 compact 的集成
+
+`sessionMemoryCompact.ts` 导出的 `trySessionMemoryCompaction()` 函数被 `autoCompact.ts` 作为**前置步骤**调用：
+
+```
+autoCompactIfNeeded()
+    ↓
+trySessionMemoryCompaction()  ← 先尝试
+    ├── 成功：token 降至阈值以下，不需要全量 compact
+    └── 失败/不足：
+compactConversation()  ← 再全量 compact
+```
+
+这种设计的好处：
+1. **节省费用**：session memory compact 不需要额外调用 Claude（利用已有的 session memory）
+2. **更快**：不需要等待 Claude 生成摘要
+3. **信息损失更小**：最近的真实消息被保留，而非被摘要替代
+
+## 压缩后的摘要格式
+
+当 session memory compact 完成后，它会生成一条特定格式的用户消息作为新的上下文起点：
+
+```typescript
+// 生成类似 compact 摘要的用户消息，但内容来自 session memory
+const summaryMessage = getCompactUserSummaryMessage(
+  sessionMemoryContent,
+  // 指示这是 session memory 模式的摘要
+)
+```
+
+`getCompactUserSummaryMessage()` 生成的消息包含：
+1. 告知模型这是经过压缩的上下文
+2. Session memory 提炼的关键信息
+3. 最后一次摘要后的消息 ID 标记（用于增量更新）
+
+```typescript
+// source/src/services/compact/prompt.ts
+export function getCompactUserSummaryMessage(
+  summary: string,
+  sessionMemoryMode?: boolean,
+): string {
+  const header = sessionMemoryMode
+    ? `<session_memory_summary>
+This is a summary of the conversation so far based on session memory.
+</session_memory_summary>`
+    : `<compact_summary>
+The following is a summary of the conversation so far.
+</compact_summary>`
+
+  return `${header}\n\n${summary}`
+}
+```
+
+## Session Memory 的更新机制
+
+压缩后，为了让后续的 session memory 提炼能正确地做增量更新，系统会记录"最后摘要的消息 ID"：
+
+```typescript
+import { setLastSummarizedMessageId } from '../SessionMemory/sessionMemoryUtils.js'
+
+// 压缩完成后，记录这次压缩覆盖到了哪条消息
+setLastSummarizedMessageId(lastMessageId)
+```
+
+下次 session memory agent 运行时，它会通过 `getLastSummarizedMessageId()` 获取这个 ID，只处理之后的新消息，避免重复工作。
+
+## 何时 session memory compact 不够用
+
+有些情况下，session memory compact 无法充分释放空间：
+
+1. Session memory 还没有生成（会话刚开始）
+2. Session memory 本身很小，保留的"最近消息"仍然占用大量 token
+3. 单条工具结果就超过了 `maxTokens` 限制
+
+此时 `trySessionMemoryCompaction()` 会返回失败，`autoCompactIfNeeded()` 转而调用全量 `compactConversation()`。
+
+<SourceRef file="source/src/services/compact/sessionMemoryCompact.ts" lines="1-240" />
+
+<ArticleComplete />

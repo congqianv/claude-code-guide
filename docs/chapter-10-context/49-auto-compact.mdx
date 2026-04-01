@@ -1,0 +1,282 @@
+---
+sidebar_position: 3
+title: autoCompact.ts：何时自动触发压缩
+description: 解析自动压缩的触发机制、阈值计算和防抖策略
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# autoCompact.ts：何时自动触发压缩
+
+<DifficultyBadge level="进阶" />
+
+自动压缩是 Claude Code 中一个"无感"的后台机制——用户在正常使用时不需要关心，但一旦触发，它能让对话在不中断的情况下突破 token 窗口的限制。`autoCompact.ts` 负责回答一个核心问题：**什么时候该压缩，什么时候还不用？**
+
+## 有效上下文窗口的计算
+
+并非整个 200K token 都可以用于对话历史。`autoCompact.ts` 首先计算"有效上下文窗口"：
+
+```typescript
+// source/src/services/compact/autoCompact.ts
+const MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000
+
+export function getEffectiveContextWindowSize(model: string): number {
+  // 为压缩摘要的输出预留空间
+  // （基于 p99.99 的压缩输出为 17,387 tokens）
+  const reservedTokensForSummary = Math.min(
+    getMaxOutputTokensForModel(model),
+    MAX_OUTPUT_TOKENS_FOR_SUMMARY,
+  )
+
+  let contextWindow = getContextWindowForModel(model, getSdkBetas())
+
+  // 支持通过环境变量覆盖（测试用）
+  const autoCompactWindow = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  if (autoCompactWindow) {
+    const parsed = parseInt(autoCompactWindow, 10)
+    if (!isNaN(parsed) && parsed > 0) {
+      contextWindow = Math.min(contextWindow, parsed)
+    }
+  }
+
+  return contextWindow - reservedTokensForSummary
+}
+```
+
+以 Claude 3.7 Sonnet（200K context，64K max output）为例：
+
+```
+有效上下文窗口 = 200,000 - min(64,000, 20,000) = 200,000 - 20,000 = 180,000 tokens
+```
+
+为什么要预留 20,000 tokens？因为压缩本身需要调用 Claude 生成摘要，这个输出也会消耗 token。如果不预留，压缩请求本身可能触发 `prompt_too_long`。
+
+## 自动压缩阈值
+
+在有效窗口基础上，再减去一个缓冲区：
+
+```typescript
+export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
+
+export function getAutoCompactThreshold(model: string): number {
+  const effectiveContextWindow = getEffectiveContextWindowSize(model)
+  const autocompactThreshold = effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+
+  // 支持通过百分比环境变量覆盖（调试用）
+  const envPercent = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+  if (envPercent) {
+    const parsed = parseFloat(envPercent)
+    if (!isNaN(parsed) && parsed > 0 && parsed <= 100) {
+      const percentageThreshold = Math.floor(
+        effectiveContextWindow * (parsed / 100),
+      )
+      return Math.min(percentageThreshold, autocompactThreshold)
+    }
+  }
+
+  return autocompactThreshold
+}
+```
+
+算下来：`180,000 - 13,000 = 167,000 tokens` 是自动压缩的触发阈值（约占总窗口的 83.5%）。
+
+## 五档警告状态机
+
+`calculateTokenWarningState()` 计算当前处于哪个警告级别：
+
+```typescript
+export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
+export const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000
+export const ERROR_THRESHOLD_BUFFER_TOKENS = 20_000
+export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
+
+export function calculateTokenWarningState(
+  tokenUsage: number,
+  model: string,
+): {
+  percentLeft: number                   // 剩余百分比
+  isAboveWarningThreshold: boolean      // 接近上限，显示黄色警告
+  isAboveErrorThreshold: boolean        // 更接近，显示红色警告
+  isAboveAutoCompactThreshold: boolean  // 触发自动压缩
+  isAtBlockingLimit: boolean            // 完全阻塞，禁止继续对话
+} {
+  const autoCompactThreshold = getAutoCompactThreshold(model)
+  const threshold = isAutoCompactEnabled()
+    ? autoCompactThreshold
+    : getEffectiveContextWindowSize(model)
+
+  const percentLeft = Math.max(
+    0,
+    Math.round(((threshold - tokenUsage) / threshold) * 100),
+  )
+
+  // 各阈值计算
+  const warningThreshold = threshold - WARNING_THRESHOLD_BUFFER_TOKENS
+  const errorThreshold = threshold - ERROR_THRESHOLD_BUFFER_TOKENS
+  const blockingLimit = effectiveWindow - MANUAL_COMPACT_BUFFER_TOKENS
+
+  return {
+    percentLeft,
+    isAboveWarningThreshold: tokenUsage >= warningThreshold,
+    isAboveErrorThreshold: tokenUsage >= errorThreshold,
+    isAboveAutoCompactThreshold: isAutoCompactEnabled() && tokenUsage >= autoCompactThreshold,
+    isAtBlockingLimit: tokenUsage >= blockingLimit,
+  }
+}
+```
+
+可视化这几个阈值：
+
+```
+0               100K             167K    177K  180K 183K
+|───────────────|─────────────────|───────|─────|────|
+                                  ↑       ↑     ↑    ↑
+                            autoCompact  warn  err  block
+                            触发压缩     黄色  红色  禁止
+```
+
+## shouldAutoCompact 的决策逻辑
+
+每次对话轮次结束后，`shouldAutoCompact()` 被调用来决定是否启动压缩：
+
+```typescript
+export async function shouldAutoCompact(
+  messages: Message[],
+  model: string,
+  querySource?: QuerySource,
+  snipTokensFreed = 0,
+): Promise<boolean> {
+
+  // 防递归：session_memory 和 compact 本身是 forked agent，不能再自我压缩
+  if (querySource === 'session_memory' || querySource === 'compact') {
+    return false
+  }
+
+  // 防递归：context collapse 的内部 agent 不触发 autocompact
+  if (feature('CONTEXT_COLLAPSE')) {
+    if (querySource === 'marble_origami') {
+      return false
+    }
+  }
+
+  // 功能开关检查
+  if (!isAutoCompactEnabled()) return false
+
+  // 实验性 reactive compact 模式：关闭 proactive autocompact
+  if (feature('REACTIVE_COMPACT')) {
+    if (getFeatureValue_CACHED_MAY_BE_STALE('tengu_cobalt_raccoon', false)) {
+      return false
+    }
+  }
+
+  // Context collapse 模式：折叠系统自己管理上下文，不需要 autocompact
+  if (feature('CONTEXT_COLLAPSE')) {
+    const { isContextCollapseEnabled } = require('../contextCollapse/index.js')
+    if (isContextCollapseEnabled()) return false
+  }
+
+  // 计算实际 token 数（扣除 snip 已释放的）
+  const tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed
+  const { isAboveAutoCompactThreshold } = calculateTokenWarningState(tokenCount, model)
+
+  return isAboveAutoCompactThreshold
+}
+```
+
+注意 `snipTokensFreed` 参数：snip 压缩（一种轻量级预压缩）可能已经释放了一些 token，需要从计数中扣除，避免触发不必要的全量压缩。
+
+## 连续失败保护
+
+如果自动压缩连续失败（例如因为上下文已经严重超限），继续重试会浪费大量 API 调用：
+
+```typescript
+// source/src/services/compact/autoCompact.ts
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+
+// AutoCompactTrackingState 记录连续失败次数
+export type AutoCompactTrackingState = {
+  compacted: boolean
+  turnCounter: number
+  turnId: string
+  consecutiveFailures?: number  // 连续失败次数，达到 3 次后停止重试
+}
+```
+
+源码注释记录了这个设计决策的数据背景：
+
+```typescript
+// BQ 2026-03-10: 1,279 sessions had 50+ consecutive failures (up to 3,272)
+// in a single session, wasting ~250K API calls/day globally.
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+```
+
+也就是说，历史数据显示有些会话的 autocompact 会失败 3000+ 次，每天全球范围内浪费 25 万次 API 调用。引入 3 次熔断机制后，这个问题得以控制。
+
+## isAutoCompactEnabled 的多层检查
+
+```typescript
+export function isAutoCompactEnabled(): boolean {
+  // 1. 环境变量完全禁用（包括手动 /compact）
+  if (isEnvTruthy(process.env.DISABLE_COMPACT)) {
+    return false
+  }
+
+  // 2. 仅禁用自动压缩，保留手动 /compact
+  if (isEnvTruthy(process.env.DISABLE_AUTO_COMPACT)) {
+    return false
+  }
+
+  // 3. 用户在全局配置中禁用
+  const userConfig = getGlobalConfig()
+  return userConfig.autoCompactEnabled
+}
+```
+
+这提供了三个层次的控制：
+- `DISABLE_COMPACT=1`：完全禁用所有压缩
+- `DISABLE_AUTO_COMPACT=1`：只禁用自动触发，用户仍可手动 `/compact`
+- 用户配置 `autoCompactEnabled: false`：持久化的用户偏好
+
+## 时序图：自动压缩的完整生命周期
+
+```
+用户发送消息
+    ↓
+query.ts 主循环
+    ↓
+Claude API 响应
+    ↓
+runTools() 执行工具
+    ↓
+tokenCountWithEstimation()  ←── 估算当前 token 使用量
+    ↓
+shouldAutoCompact()  ←─────────── 判断是否需要压缩
+    ↓ (是)
+autoCompactIfNeeded()
+    ↓
+trySessionMemoryCompaction()  ←── 先尝试 session memory 压缩（更轻量）
+    ↓ (不足以释放足够空间)
+compactConversation()  ←────────── 全量压缩
+    ↓
+更新 messages  ←────────────────── 用摘要替换历史
+    ↓
+继续下一轮对话
+```
+
+## 环境变量配置
+
+对于开发者或高级用户，autoCompact 提供了几个调试用的环境变量：
+
+| 变量 | 作用 |
+|------|------|
+| `DISABLE_COMPACT=1` | 完全禁用压缩 |
+| `DISABLE_AUTO_COMPACT=1` | 禁用自动压缩 |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW=50000` | 强制使用更小的上下文窗口（测试用） |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80` | 以百分比形式设置触发阈值 |
+| `CLAUDE_CODE_BLOCKING_LIMIT_OVERRIDE=150000` | 覆盖阻塞限制 |
+
+<SourceRef file="source/src/services/compact/autoCompact.ts" lines="28-238" />
+
+<ArticleComplete />

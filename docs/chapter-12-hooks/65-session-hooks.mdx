@@ -1,0 +1,351 @@
+---
+sidebar_position: 5
+title: "sessionHooks.ts：会话级 Hook 的生命周期"
+description: 深入解析会话级 Hook 的注册、执行、清理机制，以及 FunctionHook 的高性能内存执行模式
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# sessionHooks.ts：会话级 Hook 的生命周期
+
+<DifficultyBadge level="进阶" />
+
+## 什么是会话级 Hook？
+
+Claude Code 的 Hook 系统有两个层次：
+
+1. **持久化 Hook**：写在 `settings.json` 中，在所有会话中生效，重启后依然存在
+2. **会话级 Hook**：通过 API 动态注册，仅对当前会话有效，进程退出后消失
+
+会话级 Hook 定义在 `source/src/utils/hooks/sessionHooks.ts` 中，是一个专门为**运行时动态扩展**设计的子系统。
+
+## SessionHooksState：高性能的 Map 设计
+
+会话级 Hook 存储在全局 AppState 中，使用 `Map<string, SessionStore>` 而非普通的 JavaScript 对象（Record）：
+
+```typescript
+// 按 sessionId 分组的 Hook 存储
+export type SessionHooksState = Map<string, SessionStore>
+
+export type SessionStore = {
+  hooks: {
+    [event in HookEvent]?: SessionHookMatcher[]
+  }
+}
+
+type SessionHookMatcher = {
+  matcher: string
+  skillRoot?: string
+  hooks: Array<{
+    hook: HookCommand | FunctionHook
+    onHookSuccess?: OnHookSuccess  // 成功后的回调
+  }>
+}
+```
+
+**为什么用 Map 而不是 Record？**
+
+源码中有详细的注释解释这个决策，这是高并发场景下的性能优化：
+
+```typescript
+/**
+ * Map（而非 Record）的原因：
+ * .set()/.delete() 不改变容器自身的引用（identity）。
+ *
+ * 这让 store.ts 的 Object.is(next, prev) 检查能够短路，
+ * 跳过监听器通知。会话 Hook 是每个 Agent 的临时运行时回调，
+ * 不会被响应式读取（只通过 getAppState() 快照读取）。
+ *
+ * 在高并发工作流中：parallel() 启动 N 个 schema-mode Agent，
+ * 一个同步 tick 内触发 N 次 addFunctionHook 调用。
+ * 如果用 Record + spread，每次调用需要 O(N) 拷贝（总共 O(N²)），
+ * 还会触发全部 ~30 个 store 监听器。用 Map：.set() 是 O(1)，
+ * 返回 prev 意味着零监听器触发。
+ */
+export type SessionHooksState = Map<string, SessionStore>
+```
+
+这是一个典型的"以牺牲 React 响应式特性换取高并发性能"的设计权衡。会话 Hook 本就不需要驱动 UI 重渲染，所以这个取舍完全合理。
+
+## 两种注册方式
+
+### 1. addSessionHook：注册 shell 命令 Hook
+
+```typescript
+export function addSessionHook(
+  setAppState: (updater: (prev: AppState) => AppState) => void,
+  sessionId: string,
+  event: HookEvent,
+  matcher: string,
+  hook: HookCommand,           // 必须是持久化类型的 HookCommand
+  onHookSuccess?: OnHookSuccess,
+  skillRoot?: string,           // 技能的根目录（用于 CLAUDE_PLUGIN_ROOT）
+): void {
+  addHookToSession(
+    setAppState, sessionId, event, matcher, hook, onHookSuccess, skillRoot,
+  )
+}
+```
+
+此函数用于在会话运行时动态添加 `command`/`prompt`/`agent`/`http` 类型的 Hook。常见使用场景：
+
+- **技能系统（Skills）**：当 Claude 激活某个技能时，技能可能注册特定的 PreToolUse Hook
+- **工作流脚本**：工作流执行期间临时添加验证逻辑
+
+### 2. addFunctionHook：注册内存函数 Hook
+
+```typescript
+export function addFunctionHook(
+  setAppState: (updater: (prev: AppState) => AppState) => void,
+  sessionId: string,
+  event: HookEvent,
+  matcher: string,
+  callback: FunctionHookCallback,  // TypeScript 函数
+  errorMessage: string,
+  options?: {
+    timeout?: number
+    id?: string              // 指定 ID，方便后续移除
+  },
+): string {  // 返回 Hook ID
+  const id = options?.id || `function-hook-${Date.now()}-${Math.random()}`
+  const hook: FunctionHook = {
+    type: 'function',
+    id,
+    timeout: options?.timeout || 5000,  // 默认 5 秒
+    callback,
+    errorMessage,
+  }
+  addHookToSession(setAppState, sessionId, event, matcher, hook)
+  return id  // 返回 ID 供后续 removeFunctionHook() 使用
+}
+```
+
+`FunctionHookCallback` 的签名：
+
+```typescript
+type FunctionHookCallback = (
+  messages: Message[],  // 当前会话的消息历史
+  signal?: AbortSignal, // 用于提前终止的中断信号
+) => boolean | Promise<boolean>
+// true = 通过（允许继续）
+// false = 失败（用 errorMessage 阻断）
+```
+
+这是一种**内存执行模式**，避免了 spawn 子进程的开销，直接在 Node.js 进程中执行 TypeScript 函数。非常适合需要访问内存状态（如消息历史）的验证逻辑。
+
+## removeFunctionHook：动态注销
+
+会话级 Hook 可以在会话期间随时移除，这对"一次性验证"场景非常有用：
+
+```typescript
+export function removeFunctionHook(
+  setAppState: (updater: (prev: AppState) => AppState) => void,
+  sessionId: string,
+  event: HookEvent,
+  hookId: string,
+): void {
+  setAppState(prev => {
+    const store = prev.sessionHooks.get(sessionId)
+    if (!store) return prev
+
+    const eventMatchers = store.hooks[event] || []
+
+    // 从所有 Matcher 中过滤掉指定 ID 的 Hook
+    const updatedMatchers = eventMatchers
+      .map(matcher => {
+        const updatedHooks = matcher.hooks.filter(h => {
+          if (h.hook.type !== 'function') return true
+          return h.hook.id !== hookId
+        })
+        return updatedHooks.length > 0
+          ? { ...matcher, hooks: updatedHooks }
+          : null
+      })
+      .filter((m): m is SessionHookMatcher => m !== null)
+
+    // ... 更新 store
+  })
+}
+```
+
+**实际使用模式：**
+
+```typescript
+// 添加一次性验证 Hook
+const hookId = addFunctionHook(
+  setAppState, sessionId, 'PreToolUse', 'Bash',
+  async (messages) => {
+    // 检查消息历史中是否已经有 "已确认" 标记
+    const lastMessage = messages[messages.length - 1]
+    return lastMessage?.content?.includes('已确认')
+  },
+  '请先确认操作',
+  { id: 'one-time-bash-check' }
+)
+
+// 验证通过后，移除这个 Hook
+removeFunctionHook(setAppState, sessionId, 'PreToolUse', hookId)
+```
+
+## 内部 addHookToSession：去重逻辑
+
+两个公共注册函数都调用内部的 `addHookToSession()`，它实现了去重逻辑：
+
+```typescript
+function addHookToSession(
+  setAppState, sessionId, event, matcher, hook, onHookSuccess, skillRoot
+): void {
+  setAppState(prev => {
+    let store = prev.sessionHooks.get(sessionId)
+    if (!store) {
+      store = { hooks: {} }
+      prev.sessionHooks.set(sessionId, store)
+    }
+
+    const eventMatchers = store.hooks[event] || []
+
+    // 查找是否已存在相同 matcher 的条目
+    let existingMatcher = eventMatchers.find(m => m.matcher === matcher)
+    if (!existingMatcher) {
+      existingMatcher = { matcher, skillRoot, hooks: [] }
+      eventMatchers.push(existingMatcher)
+    }
+
+    // 去重：使用 isHookEqual() 检查是否已存在相同 Hook
+    const isDuplicate = existingMatcher.hooks.some(h =>
+      isHookEqual(h.hook, hook)
+    )
+    if (!isDuplicate) {
+      existingMatcher.hooks.push({ hook, onHookSuccess })
+    }
+
+    store.hooks[event] = eventMatchers
+    return prev  // 返回 prev（而非新对象），不触发响应式更新
+  })
+}
+```
+
+注意最后 `return prev` 而不是返回新对象，这与 Map 类型配合实现了"零监听器触发"的性能优化。
+
+## 与全局 Hook 的生命周期区别
+
+| 特性 | 全局 Hook（settings.json） | 会话级 Hook |
+|------|--------------------------|------------|
+| 持久化 | 是（文件存储） | 否（内存） |
+| 作用范围 | 所有会话 | 仅当前会话 |
+| 注册方式 | 编辑配置文件 | API 调用 |
+| 启动加载 | 是 | 否（动态注册） |
+| 清理方式 | 手动编辑文件 | 进程退出/手动调用 |
+| 访问内存状态 | 否（子进程隔离） | 是（FunctionHook） |
+
+## clearSessionHooks：会话清理
+
+当会话结束时，系统调用 `clearSessionHooks()` 清理该会话的所有注册 Hook：
+
+```typescript
+export function clearSessionHooks(
+  setAppState: (updater: (prev: AppState) => AppState) => void,
+  sessionId: string,
+): void {
+  setAppState(prev => {
+    prev.sessionHooks.delete(sessionId)
+    return prev  // 同样返回 prev，不触发响应式更新
+  })
+}
+```
+
+这个清理操作在以下场景触发：
+- 用户执行 `/clear` 命令重置会话
+- 会话自然结束（用户退出）
+- 多 Agent 场景中子代理完成任务
+
+## getSessionHooks / getSessionFunctionHooks
+
+这两个读取函数用于在 Hook 执行引擎中获取当前会话的 Hook：
+
+```typescript
+export function getSessionHooks(
+  appState: AppState,
+  sessionId: string,
+): Map<HookEvent, SessionHookMatcher[]> {
+  const store = appState.sessionHooks.get(sessionId)
+  if (!store) return new Map()
+
+  const result = new Map<HookEvent, SessionHookMatcher[]>()
+  for (const [event, matchers] of Object.entries(store.hooks)) {
+    result.set(event as HookEvent, matchers)
+  }
+  return result
+}
+```
+
+## getSessionHookCallback：回调 Hook 适配器
+
+当 `SessionHooks` 中的 Hook 需要参与全局 Hook 执行流程时，通过 `getSessionHookCallback()` 将其包装为 `HookCallback`（与全局 Hook 使用同一接口）：
+
+```typescript
+export function getSessionHookCallback(
+  hook: HookCommand | FunctionHook,
+  onHookSuccess?: OnHookSuccess,
+): HookCallback {
+  return {
+    type: 'callback',
+    callback: async (input, toolUseID, abort) => {
+      // FunctionHook：直接调用内存函数
+      if (hook.type === 'function') {
+        const passed = await hook.callback(messages, abort)
+        if (!passed) {
+          return {
+            hookSpecificOutput: undefined,
+            stopReason: hook.errorMessage,
+            continue: false,
+          }
+        }
+        return {}  // 通过
+      }
+
+      // 其他类型：委托给正常的 Hook 执行引擎
+      // ...
+    },
+  }
+}
+```
+
+## 技能系统的使用案例
+
+技能系统（Skills）是会话级 Hook 的主要用户之一。当 Claude 激活某个技能时，技能可能通过会话 Hook 注册额外的验证逻辑：
+
+```typescript
+// 技能激活时注册 Hook
+addSessionHook(
+  setAppState,
+  sessionId,
+  'PreToolUse',
+  'Bash',  // 只拦截 Bash 工具
+  {
+    type: 'command',
+    command: `${skillRoot}/hooks/pre-bash.sh`,
+  },
+  (hook, result) => {
+    // Hook 成功后的回调：更新技能状态
+    updateSkillUsageStats(skillName)
+  },
+  skillRoot,  // 设置 CLAUDE_PLUGIN_ROOT 环境变量
+)
+```
+
+## 小结
+
+会话级 Hook 是 Claude Code Hook 系统的重要补充：
+
+- **`Map` 设计**保证了高并发场景下的 O(1) 写入性能
+- **`FunctionHook`** 提供了无进程开销的内存执行模式
+- **去重逻辑**防止同一 Hook 被重复注册
+- **清理机制**确保会话结束后的资源释放
+- **与全局 Hook 无缝集成**，通过统一的 `HookCallback` 接口参与执行流程
+
+<SourceRef file="source/src/utils/hooks/sessionHooks.ts" lines="1-300" />
+
+<ArticleComplete />

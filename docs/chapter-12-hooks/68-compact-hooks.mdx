@@ -1,0 +1,376 @@
+---
+sidebar_position: 8
+title: "PreCompact / PostCompact：压缩前后的数据处理"
+description: 深入解析对话压缩时的 Hook 机制，包括状态保存、自定义压缩指令注入与压缩后恢复
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# PreCompact / PostCompact：压缩前后的数据处理
+
+<DifficultyBadge level="进阶" />
+
+## 什么是对话压缩（Compact）？
+
+Claude Code 与 Claude API 的交互中存在一个限制：上下文窗口有有限的 token 容量。当会话进行得足够长，消息历史会趋近于模型的最大上下文长度。此时，Claude Code 会执行"压缩"（Compact）操作：
+
+1. 将现有对话历史摘要为一段简洁的文本（compact_summary）
+2. 用这段摘要替换原来的完整对话历史
+3. 继续在新的"压缩后上下文"中进行对话
+
+这个过程类似于人类工作时"整理笔记"——把之前做过的事情写成摘要，释放工作记忆空间。
+
+压缩可以由两个来源触发：
+- **`auto`**：Claude Code 检测到上下文接近限制时自动触发
+- **`manual`**：用户手动执行 `/compact` 命令
+
+## PreCompact Hook
+
+### 触发时机与函数签名
+
+```typescript
+// source/src/utils/hooks.ts 第 3961 行
+export async function executePreCompactHooks(
+  compactData: {
+    trigger: 'manual' | 'auto'
+    customInstructions: string | null  // 用户指定的压缩指令
+  },
+  signal?: AbortSignal,
+  timeoutMs: number = TOOL_HOOK_EXECUTION_TIMEOUT_MS,
+): Promise<{
+  newCustomInstructions?: string   // Hook 提供的压缩指令
+  userDisplayMessage?: string      // 展示给用户的消息
+}>
+```
+
+注意：这不是异步生成器，而是普通的 `async` 函数，因为 PreCompact 需要等待所有 Hook 完成后才能开始压缩。
+
+### PreCompact 输入数据
+
+```json
+{
+  "hook_event_name": "PreCompact",
+  "session_id": "abc123",
+  "transcript_path": "/tmp/claude-sessions/abc123.json",
+  "cwd": "/Users/user/my-project",
+  "trigger": "auto",
+  "custom_instructions": null
+}
+```
+
+### PreCompact 的核心能力：注入压缩指令
+
+PreCompact 最重要的功能是通过 stdout 向压缩过程注入**自定义指令**，告诉 Claude 在摘要时应该着重保留哪些信息：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TRIGGER=$(echo "$INPUT" | jq -r '.trigger')
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+
+cd "$CWD"
+
+# 收集需要在压缩摘要中保留的重要信息
+IMPORTANT_INFO=""
+
+# 1. 当前 TODO 列表
+if [ -f "TODO.md" ]; then
+  IMPORTANT_INFO="$IMPORTANT_INFO\n\n## 当前 TODO 列表\n$(cat TODO.md | head -30)"
+fi
+
+# 2. 最近的 git 变更摘要
+if git rev-parse --is-inside-work-tree &>/dev/null; then
+  RECENT_CHANGES=$(git log --oneline -5 2>/dev/null)
+  UNCOMMITTED=$(git status --short 2>/dev/null)
+  IMPORTANT_INFO="$IMPORTANT_INFO\n\n## 最近 Git 变更\n$RECENT_CHANGES"
+  if [ -n "$UNCOMMITTED" ]; then
+    IMPORTANT_INFO="$IMPORTANT_INFO\n\n未提交变更:\n$UNCOMMITTED"
+  fi
+fi
+
+# 3. 当前工作的文件
+OPEN_FILES=$(git status --short 2>/dev/null | awk '{print $2}' | head -10)
+if [ -n "$OPEN_FILES" ]; then
+  IMPORTANT_INFO="$IMPORTANT_INFO\n\n## 正在修改的文件\n$OPEN_FILES"
+fi
+
+# 输出压缩指令（exit 0 时，stdout 会被追加到压缩指令中）
+if [ -n "$IMPORTANT_INFO" ]; then
+  printf "在压缩摘要中请务必保留以下信息：%b\n" "$IMPORTANT_INFO"
+fi
+```
+
+**exit code 对 PreCompact 的影响：**
+
+| exit code | 行为 |
+|-----------|------|
+| **0** | stdout 内容**追加**到压缩自定义指令中，作为额外的摘要指导 |
+| **2** | **阻断压缩操作**（用户会看到错误，压缩不执行） |
+| **其他** | 非阻断错误，仅展示给用户，压缩继续进行 |
+
+阻断压缩（exit 2）的使用场景：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+
+# 如果有未提交的重要变更，阻止自动压缩
+UNCOMMITTED_COUNT=$(git status --short 2>/dev/null | wc -l | tr -d ' ')
+if [ "$UNCOMMITTED_COUNT" -gt 10 ]; then
+  echo "警告：有 $UNCOMMITTED_COUNT 个未提交文件，建议先提交后再压缩" >&2
+  exit 2
+fi
+```
+
+### 返回值处理逻辑
+
+```typescript
+// source/src/utils/hooks.ts 第 3990 行
+// 提取成功 Hook 的 stdout（非空内容）
+const successfulOutputs = results
+  .filter(result => result.succeeded && result.output.trim().length > 0)
+  .map(result => result.output.trim())
+
+return {
+  // 多个 Hook 的输出用 \n\n 连接，追加到原始自定义指令后
+  newCustomInstructions:
+    successfulOutputs.length > 0 ? successfulOutputs.join('\n\n') : undefined,
+  userDisplayMessage: displayMessages.join('\n'),
+}
+```
+
+## PostCompact Hook
+
+### 触发时机与函数签名
+
+```typescript
+// source/src/utils/hooks.ts 第 4034 行
+export async function executePostCompactHooks(
+  compactData: {
+    trigger: 'manual' | 'auto'
+    compactSummary: string  // 压缩生成的摘要文本
+  },
+  signal?: AbortSignal,
+  timeoutMs: number = TOOL_HOOK_EXECUTION_TIMEOUT_MS,
+): Promise<{
+  userDisplayMessage?: string
+}>
+```
+
+### PostCompact 输入数据
+
+```json
+{
+  "hook_event_name": "PostCompact",
+  "session_id": "abc123",
+  "transcript_path": "/tmp/claude-sessions/abc123.json",
+  "cwd": "/Users/user/my-project",
+  "trigger": "auto",
+  "compact_summary": "## 会话摘要\n\n本次会话中，我帮助用户...\n\n### 完成的任务\n1. 修复了 bug #123...\n2. 添加了单元测试..."
+}
+```
+
+`compact_summary` 字段包含 Claude 生成的摘要全文，PostCompact Hook 可以读取并利用这个摘要。
+
+### PostCompact 能做什么？
+
+PostCompact 主要用于**响应压缩完成事件**：
+
+#### 1. 将摘要保存到外部系统
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TRIGGER=$(echo "$INPUT" | jq -r '.trigger')
+SUMMARY=$(echo "$INPUT" | jq -r '.compact_summary')
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id')
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# 保存摘要到文件（方便后续参考）
+SUMMARY_DIR="$HOME/.claude/compact-summaries"
+mkdir -p "$SUMMARY_DIR"
+SUMMARY_FILE="$SUMMARY_DIR/${SESSION_ID}-${TIMESTAMP}.md"
+echo "$SUMMARY" > "$SUMMARY_FILE"
+echo "压缩摘要已保存到: $SUMMARY_FILE"
+```
+
+#### 2. 发送通知
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+TRIGGER=$(echo "$INPUT" | jq -r '.trigger')
+
+if [ "$TRIGGER" = "auto" ]; then
+  # 发送系统通知
+  osascript -e 'display notification "Claude Code 自动压缩了对话" with title "Claude Code"' 2>/dev/null || \
+  notify-send "Claude Code" "对话已自动压缩" 2>/dev/null || \
+  true
+fi
+```
+
+#### 3. 重新加载关键上下文
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+
+# 压缩后，重新加载 TODO 列表到当前上下文
+# （因为压缩可能丢失了某些细节）
+TODO_FILE="$CWD/TODO.md"
+if [ -f "$TODO_FILE" ]; then
+  echo "压缩完成。当前 TODO 状态："
+  cat "$TODO_FILE"
+fi
+```
+
+**PostCompact 的 stdout 处理（exit 0 时）：** 内容展示给用户（不展示给 Claude）。
+
+## 实战示例 1：PreCompact 将 todo list 写入文件
+
+这是一个"在压缩前备份状态"的完整示例：
+
+```bash
+#!/bin/bash
+# 文件：~/.claude/hooks/pre-compact-backup.sh
+
+INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id')
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+cd "$CWD"
+BACKUP_DIR=".claude/compact-backups"
+mkdir -p "$BACKUP_DIR"
+
+BACKUP_FILE="$BACKUP_DIR/backup_${TIMESTAMP}.md"
+
+{
+  echo "# 压缩前状态备份"
+  echo "时间: $TIMESTAMP"
+  echo "会话: $SESSION_ID"
+  echo ""
+
+  # 保存 git 状态
+  if git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "## Git 状态"
+    echo '```'
+    git status --short
+    echo '```'
+    echo ""
+    echo "## 最近提交"
+    git log --oneline -10
+    echo ""
+  fi
+
+  # 保存当前 TODO
+  if [ -f "TODO.md" ]; then
+    echo "## TODO 列表"
+    cat "TODO.md"
+    echo ""
+  fi
+
+  # 保存环境变量快照
+  echo "## 关键环境变量"
+  echo "NODE_ENV: ${NODE_ENV:-未设置}"
+  echo "DATABASE_URL: ${DATABASE_URL:+已设置（值已隐藏）}"
+} > "$BACKUP_FILE"
+
+# 输出压缩指令（告诉 Claude 保留哪些关键信息）
+echo "在压缩摘要中请保留："
+echo "1. 所有待完成的 TODO 项目"
+echo "2. 当前正在处理的文件名"
+echo "3. 已发现但未修复的 bug 列表"
+echo "4. 任何重要的技术决策和原因"
+```
+
+## 实战示例 2：PostCompact 重新加载 todo list
+
+```bash
+#!/bin/bash
+# 文件：~/.claude/hooks/post-compact-reload.sh
+
+INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+SUMMARY=$(echo "$INPUT" | jq -r '.compact_summary')
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id')
+
+cd "$CWD"
+
+echo "=== 对话压缩完成 ==="
+echo ""
+
+# 展示当前 TODO 状态（供用户参考）
+if [ -f "TODO.md" ]; then
+  echo "📋 当前 TODO："
+  head -20 "TODO.md"
+  echo ""
+fi
+
+# 检查摘要中是否提到了 TODO
+if echo "$SUMMARY" | grep -qi "todo\|待完成\|未完成"; then
+  echo "✓ 压缩摘要中包含 TODO 信息"
+else
+  echo "⚠ 压缩摘要中可能未完整保留 TODO 信息，建议检查"
+fi
+```
+
+对应配置：
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/pre-compact-backup.sh",
+            "timeout": 30,
+            "statusMessage": "备份会话状态..."
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/post-compact-reload.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 压缩 Hook 与 SessionStart 的配合
+
+压缩完成后，Claude Code 会触发一个 `source: 'compact'` 的 `SessionStart` 事件（压缩相当于一次"轻量级重启"）。因此，一个完整的状态管理方案应该同时覆盖这两个 Hook：
+
+```
+PreCompact → 保存状态到文件
+  ↓ 压缩执行
+PostCompact → 通知用户压缩完成
+  ↓（自动触发）
+SessionStart (source='compact') → 重新加载状态文件，恢复上下文
+```
+
+## 小结
+
+PreCompact 和 PostCompact 是 Claude Code 为"长会话状态管理"设计的专用 Hook：
+
+- **PreCompact**：最后机会在压缩前保存关键状态，并通过 stdout 注入压缩指令
+- **PostCompact**：压缩完成后的善后处理，通知、保存摘要、重新加载上下文
+- **配合 SessionStart(compact)**：形成完整的"保存→压缩→恢复"状态管理闭环
+- **多 Hook 协作**：多个 PreCompact Hook 的 stdout 会被合并为完整的压缩指令
+
+<SourceRef file="source/src/utils/hooks.ts" lines="3961-4095" />
+
+<ArticleComplete />

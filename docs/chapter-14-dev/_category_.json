@@ -1,0 +1,8 @@
+{
+  "label": "第十四章：二次开发与生态",
+  "position": 14,
+  "link": {
+    "type": "generated-index",
+    "description": "基于 Claude Code 开发插件、使用 SDK，以及开源社区资源与未来展望"
+  }
+}

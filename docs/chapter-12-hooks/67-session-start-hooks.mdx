@@ -1,0 +1,377 @@
+---
+sidebar_position: 7
+title: "SessionStart / Setup：会话初始化 Hook 实战"
+description: 深入解析会话启动和仓库初始化 Hook 的触发机制、使用场景与完整配置示例
+---
+
+import DifficultyBadge from '@site/src/components/DifficultyBadge';
+import SourceRef from '@site/src/components/SourceRef';
+import ArticleComplete from '@site/src/components/ArticleComplete';
+
+# SessionStart / Setup：会话初始化 Hook 实战
+
+<DifficultyBadge level="进阶" />
+
+## 会话初始化的两个维度
+
+Claude Code 的会话初始化阶段有两类 Hook：
+
+- **SessionStart**：每次会话"启动"时触发（包括全新启动、恢复、清空、压缩后重启）
+- **Setup**：仓库级别的初始化/维护任务，适合检查工具链状态、安装依赖等
+
+虽然两者都在会话早期触发，但它们的语义不同：SessionStart 是"用户开始工作了"的通知，Setup 是"确保工作环境就绪"的操作。
+
+## SessionStart Hook
+
+### 触发时机
+
+```typescript
+// source/src/utils/hooks.ts 第 3867 行
+export async function* executeSessionStartHooks(
+  source: 'startup' | 'resume' | 'clear' | 'compact',
+  ...
+)
+```
+
+`source` 参数决定了触发原因：
+
+| source 值 | 触发场景 |
+|----------|---------|
+| `startup` | 首次启动 Claude Code（全新会话） |
+| `resume` | 恢复之前的会话（`claude --resume`） |
+| `clear` | 用户执行了 `/clear` 命令 |
+| `compact` | 对话经过压缩后的"重启"（CompactSummary 后的新会话） |
+
+### SessionStart 输入数据
+
+```json
+{
+  "hook_event_name": "SessionStart",
+  "session_id": "abc123",
+  "transcript_path": "/tmp/claude-sessions/abc123.json",
+  "cwd": "/Users/user/my-project",
+  "permission_mode": "default",
+  "source": "startup",
+  "agent_type": null,
+  "model": "claude-opus-4-6"
+}
+```
+
+### SessionStart 特殊行为
+
+与大多数 Hook 不同，SessionStart 对阻断错误（exit 2）的处理比较宽松：
+
+```
+SessionStart: exit 2 时，阻断错误被忽略
+（不会阻止会话启动，只是不展示给 Claude）
+```
+
+这是一个合理的设计：如果 SessionStart Hook 失败，会话还是应该继续启动，而不是让整个 Claude Code 进入"卡死"状态。
+
+`stdout`（exit 0 时）的内容会作为初始上下文注入给 Claude：
+
+```bash
+#!/bin/bash
+# SessionStart Hook：输出项目状态摘要
+echo "=== 项目状态 ==="
+echo "Git 分支: $(git branch --show-current 2>/dev/null || echo 'N/A')"
+echo "未提交变更: $(git status --short 2>/dev/null | wc -l | tr -d ' ') 个文件"
+echo "Node 版本: $(node --version 2>/dev/null || echo '未安装')"
+echo "最近提交: $(git log --oneline -1 2>/dev/null || echo 'N/A')"
+```
+
+### hookSpecificOutput 字段
+
+SessionStart 的 JSON 输出支持特殊字段：
+
+```bash
+#!/bin/bash
+INPUT=$(cat)
+SOURCE=$(echo "$INPUT" | jq -r '.source')
+
+if [ "$SOURCE" = "startup" ]; then
+  cat <<'EOF'
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": "这是今天的第一次会话。请检查 TODO.md 文件了解当前任务。",
+    "initialUserMessage": "请先阅读 TODO.md，了解今天需要完成的任务",
+    "watchPaths": ["/Users/user/my-project/.env", "/Users/user/my-project/config.yml"]
+  }
+}
+EOF
+fi
+```
+
+三个特殊字段：
+- **`additionalContext`**：注入到系统上下文中（Claude 会看到但用户不可见）
+- **`initialUserMessage`**：自动发送给 Claude 的初始用户消息（仅 `startup` 有意义）
+- **`watchPaths`**：注册到 `FileChanged` Hook 的监视路径列表
+
+## Setup Hook
+
+### 触发时机
+
+```typescript
+// source/src/utils/hooks.ts 第 3902 行
+export async function* executeSetupHooks(
+  trigger: 'init' | 'maintenance',
+  ...
+)
+```
+
+| trigger 值 | 触发场景 |
+|-----------|---------|
+| `init` | 首次在新目录打开 Claude Code |
+| `maintenance` | 定期维护检查（Claude Code 判断需要维护时触发） |
+
+### Setup 的设计意图
+
+Setup Hook 的名字来自"仓库设置"的概念，类似于 Makefile 的 `make setup` 目标。它适合：
+
+- 检查必要工具是否已安装（Docker、kubectl、Python 等）
+- 安装项目依赖（`npm install`、`pip install`）
+- 配置环境变量
+- 初始化开发数据库
+
+```bash
+#!/bin/bash
+# .claude/setup.sh - 项目初始化脚本
+INPUT=$(cat)
+TRIGGER=$(echo "$INPUT" | jq -r '.trigger')
+ENV_FILE="$CLAUDE_ENV_FILE"
+
+echo "=== 环境检查 ==="
+
+# 检查 Node.js
+if ! command -v node &> /dev/null; then
+  echo "错误：Node.js 未安装" >&2
+  exit 0  # 不阻断，让 Claude 知道这个问题
+fi
+
+echo "Node.js: $(node --version)"
+
+# 安装依赖（仅 init 时）
+if [ "$TRIGGER" = "init" ]; then
+  if [ -f "package.json" ] && [ ! -d "node_modules" ]; then
+    echo "正在安装 npm 依赖..."
+    npm install --silent
+    echo "依赖安装完成"
+  fi
+fi
+
+# 设置环境变量（通过 CLAUDE_ENV_FILE）
+if [ -n "$ENV_FILE" ]; then
+  echo "export PROJECT_NAME=$(basename $(pwd))" >> "$ENV_FILE"
+  echo "export NODE_ENV=development" >> "$ENV_FILE"
+fi
+
+echo "环境配置完成，可以开始工作！"
+```
+
+### Setup 的 stdout 处理
+
+Setup 的 stdout 内容（exit 0 时）会展示给 Claude，作为环境状态的描述：
+
+```
+SessionStart 和 Setup Hook 的 stdout 展示给：
+- SessionStart: Claude（作为初始系统上下文）
+- Setup: Claude（作为仓库状态报告）
+
+两者的 exit 2 都被忽略（不阻断会话/操作）
+```
+
+## 实战示例：检查 git 状态并提醒用户
+
+以下是一个完整的、检查代码库健康状态的 SessionStart Hook：
+
+```bash
+#!/bin/bash
+# 文件：~/.claude/hooks/check-git-status.sh
+
+INPUT=$(cat)
+SOURCE=$(echo "$INPUT" | jq -r '.source')
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+
+# 只在启动和恢复时检查（不在 clear 后重复检查）
+if [ "$SOURCE" != "startup" ] && [ "$SOURCE" != "resume" ]; then
+  exit 0
+fi
+
+cd "$CWD" 2>/dev/null || exit 0
+
+# 检查是否是 git 仓库
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+  exit 0  # 不是 git 仓库，跳过
+fi
+
+BRANCH=$(git branch --show-current 2>/dev/null)
+UNCOMMITTED=$(git status --short 2>/dev/null | wc -l | tr -d ' ')
+UNPUSHED=$(git log --oneline @{upstream}.. 2>/dev/null | wc -l | tr -d ' ')
+STASH_COUNT=$(git stash list 2>/dev/null | wc -l | tr -d ' ')
+
+# 构建状态报告
+CONTEXT="当前代码库状态（$SOURCE）："
+CONTEXT="$CONTEXT\n- 分支：$BRANCH"
+
+if [ "$UNCOMMITTED" -gt 0 ]; then
+  CONTEXT="$CONTEXT\n- 警告：有 $UNCOMMITTED 个未提交的文件变更"
+fi
+
+if [ "$UNPUSHED" -gt 0 ]; then
+  CONTEXT="$CONTEXT\n- 注意：有 $UNPUSHED 个本地提交尚未推送到远端"
+fi
+
+if [ "$STASH_COUNT" -gt 0 ]; then
+  CONTEXT="$CONTEXT\n- 提示：git stash 中有 $STASH_COUNT 个存储的变更"
+fi
+
+# 输出 JSON（包含额外上下文）
+python3 -c "
+import json
+context = '''$CONTEXT'''
+output = {
+  'hookSpecificOutput': {
+    'hookEventName': 'SessionStart',
+    'additionalContext': context
+  }
+}
+print(json.dumps(output))
+"
+```
+
+对应的 `~/.claude/settings.json` 配置：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-git-status.sh",
+            "timeout": 10,
+            "statusMessage": "检查代码库状态..."
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/check-git-status.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 实战示例：多语言项目环境检测
+
+```bash
+#!/bin/bash
+# Setup Hook：检测项目类型并安装依赖
+
+INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd')
+ENV_FILE="$CLAUDE_ENV_FILE"
+
+cd "$CWD"
+
+# 根据项目类型执行不同的初始化
+if [ -f "package.json" ]; then
+  echo "检测到 Node.js 项目"
+  if [ ! -d "node_modules" ]; then
+    npm install --silent && echo "npm 依赖安装完成"
+  fi
+  [ -n "$ENV_FILE" ] && echo "export RUNTIME=node" >> "$ENV_FILE"
+
+elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+  echo "检测到 Python 项目"
+  if [ -f "requirements.txt" ]; then
+    pip install -q -r requirements.txt && echo "Python 依赖安装完成"
+  fi
+  [ -n "$ENV_FILE" ] && echo "export RUNTIME=python" >> "$ENV_FILE"
+
+elif [ -f "go.mod" ]; then
+  echo "检测到 Go 项目"
+  [ -n "$ENV_FILE" ] && echo "export RUNTIME=go" >> "$ENV_FILE"
+  [ -n "$ENV_FILE" ] && echo "export GOPATH=$(go env GOPATH)" >> "$ENV_FILE"
+
+elif [ -f "Cargo.toml" ]; then
+  echo "检测到 Rust 项目"
+  [ -n "$ENV_FILE" ] && echo "export RUNTIME=rust" >> "$ENV_FILE"
+fi
+
+echo "环境初始化完成"
+```
+
+```json
+{
+  "hooks": {
+    "Setup": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/setup.sh",
+            "timeout": 120,
+            "statusMessage": "初始化项目环境..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## SessionEnd Hook
+
+与 SessionStart 相对，SessionEnd 在会话结束时触发：
+
+```typescript
+type SessionEndHookInput = {
+  hook_event_name: 'SessionEnd'
+  reason: 'clear' | 'logout' | 'prompt_input_exit' | 'other'
+  // ...基础字段
+}
+```
+
+特殊的**超时限制**（默认 1500ms）：会话结束时不能无限等待，所以 SessionEnd Hook 有极短的默认超时。可通过环境变量覆盖：
+
+```bash
+export CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000  # 延长到 5 秒
+```
+
+**SessionEnd Hook 示例：**
+
+```bash
+#!/bin/bash
+# 会话结束时保存工作状态
+INPUT=$(cat)
+REASON=$(echo "$INPUT" | jq -r '.reason')
+
+if [ "$REASON" = "clear" ] || [ "$REASON" = "logout" ]; then
+  # 保存当前工作状态（时间有限，只做快速操作）
+  git status --short > /tmp/claude-session-end-status.txt 2>/dev/null
+fi
+```
+
+## 小结
+
+SessionStart 和 Setup 是 Claude Code 提供的"会话感知"扩展点：
+
+- **SessionStart** 适合环境状态汇报、初始上下文注入、文件监视注册
+- **Setup** 适合依赖安装、工具链检查、环境变量配置
+- **两者都宽容对待失败**：exit 2 不阻断会话，保证 Claude 总能启动
+- **`CLAUDE_ENV_FILE`** 是将环境变量从 Hook 传递到后续 Bash 命令的关键机制
+
+<SourceRef file="source/src/utils/hooks.ts" lines="3867-3922" />
+
+<ArticleComplete />
