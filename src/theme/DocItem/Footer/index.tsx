@@ -16,10 +16,10 @@ export default function FooterWrapper(props: Props): React.ReactElement {
       <div style={{ marginTop: '2rem' }}>
         <Giscus
           id="comments"
-          repo="your-github-username/claude-code-guide"
-          repoId="YOUR_REPO_ID"
+          repo="wzf1997/claude-code-guide"
+          repoId="R_kgDOR2wy7A"
           category="Announcements"
-          categoryId="YOUR_CATEGORY_ID"
+          categoryId="DIC_kwDOR2wy7M4C5wyP"
           mapping="pathname"
           reactionsEnabled="1"
           emitMetadata="0"
